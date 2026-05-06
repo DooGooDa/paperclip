@@ -1798,6 +1798,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
   async function reconcileStrandedAssignedIssues() {
     const now = new Date();
+    // Exclude `routine_execution` candidates: those issues are reborn every cron tick by
+    // routineRunIssueCreator. They are intentionally short-lived dispatch shells, not
+    // long-running work. Treating them as stranded turns each routine fire into
+    //   1. routine_execution issue created (status=todo)
+    //   2. reconcile picks it up before the agent run starts
+    //   3. recovery sub-issue created + parent moved to status=blocked
+    //   4. recovery sub-issue itself stays blocked → permanent dup-wake loop
+    // The routine scheduler is the live execution path for these; reconcile would
+    // only generate noise. Other origins (manual, stranded_issue_recovery, etc.)
+    // remain in scope.
     const candidates = await db
       .select()
       .from(issues)
@@ -1806,6 +1816,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           isNull(issues.assigneeUserId),
           inArray(issues.status, ["todo", "in_progress"]),
           sql`${issues.assigneeAgentId} is not null`,
+          sql`${issues.originKind} is distinct from 'routine_execution'`,
         ),
       );
 
