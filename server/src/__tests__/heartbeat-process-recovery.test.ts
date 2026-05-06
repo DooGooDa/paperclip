@@ -2842,4 +2842,156 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       payload: expect.objectContaining({ issueId }),
     });
   });
+
+  // DGG-5493 (FAIL trail of DGG-5210 monitoring): when a source issue cycles
+  // blocked → in_progress (via user/agent comment-PATCH) and back, the
+  // pre-fix code spawned a brand-new stranded recovery sub-issue every
+  // reconcile tick because:
+  //   - findOpenStrandedIssueRecoveryIssue excludes done/cancelled.
+  //   - AC-3 auto-dones recovery sub-issues quickly once the retry succeeds.
+  // Evidence: DGG-5390 saw 7 sub-issues in 23min, DGG-5088 saw 8 in 24h,
+  // DGG-5419 saw a dup 12min apart — even though DGG-5210 cap+dedup were
+  // already deployed.
+  // The fix bounds sub-issue *creation* per source: 1h dedup (reuse the
+  // most recent regardless of status) and 24h cap of
+  // STRANDED_RECOVERY_RETRY_BUDGET_MAX_ATTEMPTS = 3.
+  it("DGG-5493: skips creating a new recovery sub-issue when a recent one (any status) exists for the same source within 1h", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "process_lost",
+      runError: "Lost in-memory process handle",
+    });
+    const nowMs = Date.now();
+    // Anchor the seeded run inside the live cap window so reconcile
+    // evaluates it as a fresh failure (not an old artifact). We are
+    // testing that *despite* a fresh failure, the creation dedup gate
+    // suppresses a brand-new sub-issue when one already exists.
+    const seedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!seedRun) throw new Error("expected seed heartbeat run");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        startedAt: new Date(nowMs - 5 * 60 * 1000),
+        finishedAt: new Date(nowMs - 4 * 60 * 1000),
+        createdAt: new Date(nowMs - 5 * 60 * 1000),
+        updatedAt: new Date(nowMs - 4 * 60 * 1000),
+      })
+      .where(eq(heartbeatRuns.id, seedRun.id));
+
+    // Pre-existing recently-done recovery sub-issue (created 30min ago,
+    // already auto-done by AC-3). Pre-fix this would NOT prevent a new
+    // creation; post-fix the dedup gate must reuse it.
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const recoveryIssueId = randomUUID();
+    const thirtyMinAgo = new Date(nowMs - 30 * 60 * 1000);
+    await db.insert(issues).values({
+      id: recoveryIssueId,
+      companyId,
+      title: `Recover stalled issue ${issuePrefix}-1`,
+      status: "done",
+      priority: "medium",
+      issueNumber: 99,
+      identifier: `${issuePrefix}-99`,
+      originKind: "stranded_issue_recovery",
+      originId: issueId,
+      assigneeAgentId: agentId,
+      createdAt: thirtyMinAgo,
+      updatedAt: thirtyMinAgo,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Source still escalates (cap-on-runs path may or may not fire here;
+    // for this fixture the same-source dedup gate sees no prior automatic
+    // recovery run with this fingerprint, so the failure-recovery path
+    // takes us to escalateStrandedAssignedIssue), but no NEW sub-issue is
+    // created.
+    expect(result.recoveryIssueCreationDeduped).toBe(1);
+    const subIssues = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(subIssues).toHaveLength(1);
+    expect(subIssues[0]?.id).toBe(recoveryIssueId);
+  });
+
+  it("DGG-5493: caps recovery sub-issue creation at 3 per source within 24h", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "process_lost",
+      runError: "Lost in-memory process handle",
+    });
+    const nowMs = Date.now();
+    const seedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!seedRun) throw new Error("expected seed heartbeat run");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        startedAt: new Date(nowMs - 5 * 60 * 1000),
+        finishedAt: new Date(nowMs - 4 * 60 * 1000),
+        createdAt: new Date(nowMs - 5 * 60 * 1000),
+        updatedAt: new Date(nowMs - 4 * 60 * 1000),
+      })
+      .where(eq(heartbeatRuns.id, seedRun.id));
+
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    // 3 prior sub-issues in the 24h window, all >1h old so the dedup gate
+    // does not fire; cap path must take over.
+    for (let i = 0; i < 3; i += 1) {
+      const created = new Date(nowMs - (2 + i) * 60 * 60 * 1000);
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId,
+        title: `Recover stalled issue ${issuePrefix}-1 (#${i + 1})`,
+        status: "done",
+        priority: "medium",
+        issueNumber: 100 + i,
+        identifier: `${issuePrefix}-${100 + i}`,
+        originKind: "stranded_issue_recovery",
+        originId: issueId,
+        assigneeAgentId: agentId,
+        createdAt: created,
+        updatedAt: created,
+      });
+    }
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.recoveryIssueCreationCapped).toBe(1);
+    const subIssues = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(subIssues).toHaveLength(3);
+  });
 });

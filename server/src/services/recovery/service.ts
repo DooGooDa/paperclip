@@ -1508,6 +1508,59 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
   }
 
+  // DGG-5493 (FAIL trail): the run-level cap+dedup from DGG-5210 catches
+  // *runs* but does not bound *recovery sub-issue creation*. When a source
+  // issue is escalated to `blocked`, then user/agent flips it back via
+  // comment-PATCH and the next reconcile tick fires, `findOpenStranded
+  // IssueRecoveryIssue` excludes done/cancelled and AC-3 auto-dones
+  // recovery sub-issues quickly — so each reopen→reconcile cycle spawns a
+  // brand-new sub-issue. Evidence: DGG-5390 saw 7 sub-issues in 23min,
+  // DGG-5088 saw 8 in 24h, DGG-5419 saw a dup 12min apart. We bound this
+  // per source by counting recently-created stranded recovery sub-issues
+  // (regardless of status) inside the existing
+  // STRANDED_RECOVERY_RETRY_BUDGET_WINDOW_MS / SAME_SOURCE_DEDUP_WINDOW_MS.
+  async function countRecentStrandedIssueRecoveryIssuesForSource(
+    companyId: string,
+    sourceIssueId: string,
+    since: Date,
+  ) {
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STRANDED_ISSUE_RECOVERY_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          isNull(issues.hiddenAt),
+          gt(issues.createdAt, since),
+        ),
+      );
+    return rows.length;
+  }
+
+  async function findRecentStrandedIssueRecoveryIssueForSource(
+    companyId: string,
+    sourceIssueId: string,
+    since: Date,
+  ) {
+    return db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STRANDED_ISSUE_RECOVERY_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          isNull(issues.hiddenAt),
+          gt(issues.createdAt, since),
+        ),
+      )
+      .orderBy(desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
   async function resolveStrandedIssueRecoveryOwnerAgentId(issue: typeof issues.$inferSelect) {
     const candidateIds: string[] = [];
     if (issue.assigneeAgentId) {
@@ -1586,11 +1639,68 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     issue: typeof issues.$inferSelect;
     latestRun: LatestIssueRun;
     previousStatus: "todo" | "in_progress";
+    onCreationDeduped?: () => void;
+    onCreationCapped?: () => void;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) return null;
 
     const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
     if (existing) return existing;
+
+    // DGG-5493: bound recovery sub-issue creation per source. The DGG-5210
+    // run-level cap+dedup (3 runs / 24h, 1h same-source dedup) does not
+    // catch this loop:
+    //   1. reconcile escalates source -> blocked, creates sub-issue.
+    //   2. AC-3 auto-dones the sub-issue once its retry succeeds.
+    //   3. user/agent comment-PATCH flips source back to in_progress.
+    //   4. next reconcile tick sees no OPEN sub-issue (all done) and the
+    //      cap looks at *runs*, not *creations* — spawns a brand-new
+    //      sub-issue.
+    // We add two guards on creation, keyed on the source issue id:
+    //   - 1h window: at most 1 sub-issue created. If one was created in
+    //     the last hour (regardless of its status), reuse it as the
+    //     blocker reference and skip creating a new one. The cap path
+    //     above will catch the run-level loop on subsequent ticks.
+    //   - 24h window: cap at STRANDED_RECOVERY_RETRY_BUDGET_MAX_ATTEMPTS
+    //     so a long-running incident cannot generate >3 sub-issues per
+    //     source, mirroring the run-budget contract.
+    const now = new Date();
+    const dedupSince = new Date(
+      now.getTime() - STRANDED_RECOVERY_SAME_SOURCE_DEDUP_WINDOW_MS,
+    );
+    const recentSubIssue = await findRecentStrandedIssueRecoveryIssueForSource(
+      input.issue.companyId,
+      input.issue.id,
+      dedupSince,
+    );
+    if (recentSubIssue) {
+      input.onCreationDeduped?.();
+      return recentSubIssue;
+    }
+
+    const budgetSince = new Date(
+      now.getTime() - STRANDED_RECOVERY_RETRY_BUDGET_WINDOW_MS,
+    );
+    const recentSubIssueCount = await countRecentStrandedIssueRecoveryIssuesForSource(
+      input.issue.companyId,
+      input.issue.id,
+      budgetSince,
+    );
+    if (recentSubIssueCount >= STRANDED_RECOVERY_RETRY_BUDGET_MAX_ATTEMPTS) {
+      input.onCreationCapped?.();
+      const cappedFallback = await findRecentStrandedIssueRecoveryIssueForSource(
+        input.issue.companyId,
+        input.issue.id,
+        budgetSince,
+      );
+      // Return the most recent sub-issue (even if done/cancelled) so the
+      // escalation comment still has a stable reference, and skip creating
+      // a new shell. The blocker relation will not re-link a closed
+      // sub-issue (existingUnresolvedBlockerIssueIds filters those out),
+      // which is the desired behaviour: source goes blocked, no new sub.
+      if (cappedFallback) return cappedFallback;
+      return null;
+    }
 
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     if (!ownerAgentId) return null;
@@ -1844,6 +1954,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: "todo" | "in_progress";
     latestRun: LatestIssueRun;
     comment: string;
+    onRecoveryIssueCreationDeduped?: () => void;
+    onRecoveryIssueCreationCapped?: () => void;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -1857,6 +1969,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       issue: input.issue,
       previousStatus: input.previousStatus,
       latestRun: input.latestRun,
+      onCreationDeduped: input.onRecoveryIssueCreationDeduped,
+      onCreationCapped: input.onRecoveryIssueCreationCapped,
     });
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
     const nextBlockerIds = recoveryIssue
@@ -1942,7 +2056,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       sameSourceDedupSkipped: 0,
       capEscalated: 0,
       recoveryAutoDone: 0,
+      recoveryIssueCreationDeduped: 0,
+      recoveryIssueCreationCapped: 0,
       issueIds: [] as string[],
+    };
+
+    // DGG-5493: ensureStrandedIssueRecoveryIssue exposes its dedup/cap
+    // decision via these collectors so reconcile can record the outcome
+    // for tests / observability without threading another return shape.
+    const onRecoveryIssueCreationDeduped = () => {
+      result.recoveryIssueCreationDeduped += 1;
+    };
+    const onRecoveryIssueCreationCapped = () => {
+      result.recoveryIssueCreationCapped += 1;
     };
 
     for (const issue of candidates) {
@@ -1994,6 +2120,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           comment:
             "Paperclip exhausted the external rate-limit backoff ladder (5m → 15m → 1h → manual) for this " +
             "issue without recovering. Moving it to `blocked` for manual/COO intervention.",
+          onRecoveryIssueCreationDeduped,
+          onRecoveryIssueCreationCapped,
         });
         if (updated) {
           result.escalated += 1;
@@ -2025,6 +2153,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             "Paperclip paused automatic stranded-work recovery for this issue because the same source issue " +
             `already consumed ${recentRecoveryAttempts} automatic recovery attempts inside 24h. ` +
             "Moving it to `blocked` for manual/COO intervention instead of continuing the retry loop.",
+          onRecoveryIssueCreationDeduped,
+          onRecoveryIssueCreationCapped,
         });
         if (updated) {
           result.escalated += 1;
@@ -2152,6 +2282,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
               `but it still has no live execution path.${failureSummary ?? ""} ` +
               "Moving it to `blocked` so it is visible for intervention.",
+            onRecoveryIssueCreationDeduped,
+            onRecoveryIssueCreationCapped,
           });
           if (updated) {
             result.escalated += 1;
@@ -2205,6 +2337,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             comment:
               "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
               "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+            onRecoveryIssueCreationDeduped,
+            onRecoveryIssueCreationCapped,
           });
           if (updated) {
             result.escalated += 1;
@@ -2273,6 +2407,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
             `execution disappeared, but it still has no live execution path.${failureSummary ?? ""} ` +
             "Moving it to `blocked` so it is visible for intervention.",
+          onRecoveryIssueCreationDeduped,
+          onRecoveryIssueCreationCapped,
         });
         if (updated) {
           result.escalated += 1;
