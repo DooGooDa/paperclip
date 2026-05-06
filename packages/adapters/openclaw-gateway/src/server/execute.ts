@@ -1136,7 +1136,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+  // OpenClaw Gateway enforces strict agent param validation and rejects unknown
+  // root keys ("invalid agent params: at root: unexpected property 'paperclip'").
+  // The paperclip metadata is already encoded into the message field via
+  // wakeText/PAPERCLIP_* env vars, so we must not send it as a separate root key.
+  // Re-introducing this line will immediately blackhole every routine_execution
+  // dispatch into blocked + spawn stranded_issue_recovery sub-issues. Keep it removed.
+  // (Originally fixed by 6c9e639a; re-added during a later upstream merge — do not reintroduce.)
+  // agentParams.paperclip = paperclipPayload;
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {

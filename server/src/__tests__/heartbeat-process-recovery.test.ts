@@ -24,6 +24,8 @@ import {
   issueTreeHoldMembers,
   issueTreeHolds,
   issues,
+  routines,
+  routineTriggers,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -320,6 +322,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.delete(issueRelations);
     await db.delete(issueTreeHoldMembers);
     await db.delete(issueTreeHolds);
+    // DGG-5094: routine triggers reference routines (FK), routines reference
+    // agents AND issues. Delete trigger → routine before issues so the
+    // issues delete loop below does not hit FK violations.
+    await db.delete(routineTriggers);
+    await db.delete(routines);
     for (let attempt = 0; attempt < 5; attempt += 1) {
       await db.delete(issueComments);
       await db.delete(issueDocuments);
@@ -2366,12 +2373,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   // anchors run timestamps near `Date.now()` so the dedup window
   // (now - 1h) actually contains them — reconcile uses real-time `now`.
   it("DGG-5210 AC-1: skips a same-source automatic recovery retry inside the 1h dedup window", async () => {
+    // DGG-5109 (AC-3) note: use a non-external-rate-limit error code so the
+    // backoff ladder does not pre-empt the same-source dedup path. AC-1's
+    // semantics are about fingerprint dedup, not provider quota waits.
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
-      runErrorCode: "openclaw_gateway_wait_error",
-      runError: "OpenClaw gateway exhausted",
+      runErrorCode: "process_lost",
+      runError: "Lost in-memory process handle",
     });
     // Re-stamp the seed fixture run into the live dedup window, then insert
     // a prior automatic recovery run with the same fingerprint, also inside
@@ -2413,8 +2423,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       finishedAt: new Date(nowMs - 29 * 60 * 1000),
       createdAt: new Date(nowMs - 30 * 60 * 1000),
       updatedAt: new Date(nowMs - 29 * 60 * 1000),
-      errorCode: "openclaw_gateway_wait_error",
-      error: "OpenClaw gateway exhausted",
+      errorCode: "process_lost",
+      error: "Lost in-memory process handle",
     });
     const heartbeat = heartbeatService(db);
 
@@ -2445,12 +2455,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   // Run timestamps are anchored near `Date.now()` so the live 24h window
   // contains them; reconcile uses real-time `now`.
   it("DGG-5210 AC-2: escalates an issue to blocked once 3 automatic recovery attempts are consumed inside 24h", async () => {
+    // DGG-5109 (AC-3) note: use a non-external-rate-limit error code so the
+    // backoff ladder does not pre-empt the cap path. AC-2's semantics are
+    // about retry-budget exhaustion regardless of failure source.
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "failed",
       retryReason: "issue_continuation_needed",
-      runErrorCode: "openclaw_gateway_wait_error",
-      runError: "OpenClaw gateway exhausted",
+      runErrorCode: "process_lost",
+      runError: "Lost in-memory process handle",
     });
     const nowMs = Date.now();
     const seedRun = await db
@@ -2571,5 +2584,175 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // recovery issue.
     const source = await db.select().from(issues).where(eq(issues.id, sourceIssueId)).then((rows) => rows[0] ?? null);
     expect(source?.status).toBe("blocked");
+  });
+
+  // DGG-5109 (AC-3): external rate-limit failures must not be retried
+  // immediately. Inside the first ladder step (5m) the reconciler should
+  // simply skip — no escalation, no requeue.
+  it("DGG-5109 AC-3: backs off external rate-limit failures instead of retrying immediately", async () => {
+    const { companyId, agentId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "openclaw_gateway_wait_error",
+      runError: "429 RESOURCE_EXHAUSTED: ChatGPT pro limit hit",
+    });
+    const recent = new Date(Date.now() - 60_000);
+    await db
+      .update(heartbeatRuns)
+      .set({
+        createdAt: recent,
+        startedAt: recent,
+        finishedAt: recent,
+        updatedAt: recent,
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId)));
+    expect(runs).toHaveLength(1);
+  });
+
+  // DGG-5109 (AC-3): once the ladder is exhausted (3 prior external
+  // rate-limit attempts), the next failure must escalate to manual/blocked
+  // with the ladder-exhaustion comment.
+  it("DGG-5109 AC-3: moves external rate-limit recovery to manual after the backoff ladder is exhausted", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      runErrorCode: "openclaw_gateway_wait_error",
+      runError: "429 RESOURCE_EXHAUSTED: ChatGPT pro limit hit",
+    });
+    const now = new Date();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        createdAt: new Date(now.getTime() - 90 * 60_000),
+        startedAt: new Date(now.getTime() - 90 * 60_000),
+        finishedAt: new Date(now.getTime() - 90 * 60_000),
+        updatedAt: new Date(now.getTime() - 90 * 60_000),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(heartbeatRuns).values(
+      Array.from({ length: 3 }, (_, index) => ({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed" as const,
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_continuation_needed",
+          source: "external_rate_limit_backoff",
+        },
+        startedAt: new Date(now.getTime() - (index + 2) * 90 * 60_000),
+        finishedAt: new Date(now.getTime() - (index + 2) * 90 * 60_000 + 30_000),
+        createdAt: new Date(now.getTime() - (index + 2) * 90 * 60_000),
+        updatedAt: new Date(now.getTime() - (index + 2) * 90 * 60_000 + 30_000),
+        errorCode: "openclaw_gateway_wait_error",
+        error: "429 RESOURCE_EXHAUSTED: ChatGPT pro limit hit",
+      })),
+    );
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments[0]?.body).toContain("5m → 15m → 1h → manual");
+  });
+
+  // DGG-5094: hasActiveExecutionPath must recognise an active routine with a
+  // future-scheduled trigger as a live execution path so reconcile does not
+  // re-wake an issue parked on an external dependency cron.
+  it("DGG-5094: skips reconcile when issue has an active routine with a future-scheduled cron trigger", async () => {
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+
+    const routineId = randomUUID();
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "External-dependency follow-up routine",
+      assigneeAgentId: agentId,
+      parentIssueId: issueId,
+      status: "active",
+    });
+
+    const futureDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    await db.insert(routineTriggers).values({
+      id: randomUUID(),
+      companyId,
+      routineId,
+      kind: "schedule",
+      enabled: true,
+      cronExpression: "0 9 13 5 *",
+      nextRunAt: futureDate,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.companyId, companyId)));
+    expect(wakeups).toHaveLength(0);
+  });
+
+  it("DGG-5094: still reconciles todo issue when the linked routine trigger nextRunAt is in the past (expired schedule)", async () => {
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
+
+    const routineId = randomUUID();
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Expired routine",
+      assigneeAgentId: agentId,
+      parentIssueId: issueId,
+      status: "active",
+    });
+
+    const pastDate = new Date(Date.now() - 60 * 1000);
+    await db.insert(routineTriggers).values({
+      id: randomUUID(),
+      companyId,
+      routineId,
+      kind: "schedule",
+      enabled: true,
+      cronExpression: "* * * * *",
+      nextRunAt: pastDate,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.assignmentDispatched).toBe(1);
+    expect(result.skipped).toBe(0);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.companyId, companyId)));
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]).toMatchObject({
+      reason: "issue_assigned",
+      payload: expect.objectContaining({ issueId }),
+    });
   });
 });

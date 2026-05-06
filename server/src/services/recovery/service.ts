@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -19,6 +19,8 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  routines,
+  routineTriggers,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -67,6 +69,15 @@ const STRANDED_RECOVERY_RETRY_BUDGET_MAX_ATTEMPTS = 3;
 // intervention through the cap path instead of comment-spamming the issue
 // with another identical retry note.
 const STRANDED_RECOVERY_SAME_SOURCE_DEDUP_WINDOW_MS = 60 * 60 * 1000;
+// DGG-5109 (AC-3): external rate-limit backoff ladder. When a recovery run
+// fails because the upstream provider hit its quota (ChatGPT pro limit /
+// `openclaw_gateway_wait_error` / 429 / RESOURCE_EXHAUSTED), retrying inside
+// 1 minute is wasted work — the upstream window has not refilled yet. We
+// escalate the wait between attempts on a fixed ladder: 5m → 15m → 1h →
+// manual. After the ladder is exhausted the issue is escalated to `blocked`
+// (manual) so the COO/CTO can intervene instead of looping forever.
+const EXTERNAL_RATE_LIMIT_BACKOFF_DELAYS_MS = [5 * 60 * 1000, 15 * 60 * 1000, 60 * 60 * 1000] as const;
+const EXTERNAL_RATE_LIMIT_RECOVERY_REASON = "external_rate_limit_backoff";
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -201,6 +212,48 @@ function isUnsuccessfulTerminalIssueRun(latestRun: LatestIssueRun) {
         latestRun.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
       ),
   );
+}
+
+// DGG-5109 (AC-3): detect external provider rate-limit failures so the
+// reconciler can route them through the backoff ladder instead of the
+// generic immediate-retry path. Sniffs `errorCode`, `error` text, and any
+// stringifiable bits of `contextSnapshot` so adapter-specific failure
+// surfaces still group under the same external bucket.
+function stringifyForRecoveryDetection(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function isExternalRateLimitRun(run: LatestIssueRun) {
+  if (!run) return false;
+  const haystack = [
+    run.errorCode,
+    run.error,
+    stringifyForRecoveryDetection(run.contextSnapshot),
+  ].join("\n").toLowerCase();
+
+  return [
+    "429",
+    "rate limit",
+    "rate_limit",
+    "resource_exhausted",
+    "quota",
+    "usage limit",
+    "pro limit",
+    "chatgpt pro",
+    "openclaw_gateway_wait_error",
+    "gateway_wait_error",
+    "too many requests",
+  ].some((needle) => haystack.includes(needle));
+}
+
+function runTerminalAt(run: LatestIssueRun) {
+  return run?.finishedAt ?? run?.createdAt ?? null;
 }
 
 function isSuccessfulInProgressContinuationRun(latestRun: LatestIssueRun): latestRun is SuccessfulLatestIssueRun {
@@ -460,8 +513,67 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return false;
   }
 
+  // DGG-5109 (AC-3): collect recent runs for this issue that already failed
+  // because of an external provider rate-limit. Used to count which step of
+  // the backoff ladder we are on, so each cron tick escalates the wait
+  // instead of retrying every minute.
+  async function getRecentExternalRateLimitRuns(
+    companyId: string,
+    issueId: string,
+    now = new Date(),
+  ) {
+    const since = new Date(now.getTime() - STRANDED_RECOVERY_RETRY_BUDGET_WINDOW_MS);
+    const rows = await getRecentIssueRuns(companyId, issueId, since);
+    return rows.filter((run) => isUnsuccessfulTerminalIssueRun(run) && isExternalRateLimitRun(run));
+  }
+
+  // DGG-5109 (AC-3): decide what to do about a run that just failed because
+  // of an external rate-limit. The four outcomes are:
+  //   - none      : not an external rate-limit failure, fall through to the
+  //                 normal recovery path.
+  //   - wait      : the next ladder step has not elapsed yet — skip the
+  //                 recovery without enqueuing another retry.
+  //   - retry_now : the ladder step elapsed; queue the retry through the
+  //                 external_rate_limit_backoff source so the same-source
+  //                 cap counter excludes it from the generic 24h budget.
+  //   - manual    : the ladder is exhausted; escalate to `blocked` so the
+  //                 COO/CTO can intervene.
+  async function evaluateExternalRateLimitBackoff(
+    companyId: string,
+    issueId: string,
+    latestRun: LatestIssueRun,
+    now = new Date(),
+  ) {
+    if (!latestRun || !isUnsuccessfulTerminalIssueRun(latestRun) || !isExternalRateLimitRun(latestRun)) {
+      return { kind: "none" as const };
+    }
+
+    const recentRateLimitRuns = await getRecentExternalRateLimitRuns(companyId, issueId, now);
+    const latestIncluded = recentRateLimitRuns.some((run) => run.id === latestRun.id);
+    const attempt = Math.max(1, recentRateLimitRuns.length + (latestIncluded ? 0 : 1));
+    const delayMs = EXTERNAL_RATE_LIMIT_BACKOFF_DELAYS_MS[attempt - 1];
+    if (typeof delayMs !== "number") {
+      return { kind: "manual" as const, attempt };
+    }
+
+    const completedAt = runTerminalAt(latestRun);
+    if (!completedAt) return { kind: "retry_now" as const, attempt, delayMs };
+    const readyAt = new Date(completedAt.getTime() + delayMs);
+    if (readyAt.getTime() > now.getTime()) {
+      return { kind: "wait" as const, attempt, delayMs, readyAt };
+    }
+
+    return { kind: "retry_now" as const, attempt, delayMs };
+  }
+
   async function hasActiveExecutionPath(companyId: string, issueId: string) {
-    const [run, deferredWake] = await Promise.all([
+    // DGG-5094: also recognise an active routine with a future-scheduled
+    // trigger as a live execution path. Issues waiting on an external
+    // dependency (e.g. CEO return date, scheduled API readiness) keep their
+    // status=in_progress while a cron-driven routine carries the next wake.
+    // Without this guard, reconcileStrandedAssignedIssues misclassifies them
+    // as stranded and triggers a recovery wake-loop (DGG-5074 incident).
+    const [run, deferredWake, scheduledRoutine] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -486,9 +598,25 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         )
         .limit(1)
         .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: routines.id })
+        .from(routines)
+        .innerJoin(routineTriggers, eq(routineTriggers.routineId, routines.id))
+        .where(
+          and(
+            eq(routines.companyId, companyId),
+            eq(routines.parentIssueId, issueId),
+            eq(routines.status, "active"),
+            eq(routineTriggers.enabled, true),
+            isNotNull(routineTriggers.nextRunAt),
+            gt(routineTriggers.nextRunAt, sql`now()`),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
     ]);
 
-    return Boolean(run || deferredWake);
+    return Boolean(run || deferredWake || scheduledRoutine);
   }
 
   async function hasQueuedIssueWake(companyId: string, issueId: string) {
@@ -1842,6 +1970,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
       const latestRun = await getLatestIssueRun(issue.companyId, issue.id);
 
+      // DGG-5109 (AC-3): if the latest failure is an external provider
+      // rate-limit (ChatGPT pro / openclaw_gateway_wait_error / 429), gate
+      // it through the backoff ladder *before* counting against the generic
+      // 24h cap or enqueuing another retry. 1-minute retries against an
+      // upstream quota are wasted work; the ladder forces 5m / 15m / 1h
+      // waits and finally escalates to manual when exhausted.
+      const externalRateLimitBackoff = await evaluateExternalRateLimitBackoff(
+        issue.companyId,
+        issue.id,
+        latestRun,
+        now,
+      );
+      if (externalRateLimitBackoff.kind === "wait") {
+        result.skipped += 1;
+        continue;
+      }
+      if (externalRateLimitBackoff.kind === "manual") {
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: issue.status as "todo" | "in_progress",
+          latestRun,
+          comment:
+            "Paperclip exhausted the external rate-limit backoff ladder (5m → 15m → 1h → manual) for this " +
+            "issue without recovering. Moving it to `blocked` for manual/COO intervention.",
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
       // DGG-5210 (AC-2): cap automatic stranded-recovery retries inside the
       // 24h budget window. When the cap is exhausted the issue must escalate
       // to `blocked` and stop participating in the retry loop — otherwise
@@ -1954,6 +2116,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
+          // DGG-5109 (AC-3): if the latest failure is an external rate-limit and
+          // the ladder step has elapsed, requeue the retry through the
+          // external_rate_limit_backoff source so the same-source dedup gate keeps
+          // the ladder count separate from the generic 24h budget.
+          if (externalRateLimitBackoff.kind === "retry_now") {
+            if (await isInvocationBudgetBlocked(issue, agentId)) {
+              result.skipped += 1;
+              continue;
+            }
+
+            const queued = await enqueueStrandedIssueRecovery({
+              issueId: issue.id,
+              agentId,
+              reason: "issue_assignment_recovery",
+              retryReason: "assignment_recovery",
+              source: EXTERNAL_RATE_LIMIT_RECOVERY_REASON,
+              retryOfRunId: latestRun.id,
+            });
+            if (queued) {
+              result.dispatchRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
           const updated = await escalateStrandedAssignedIssue({
             issue,
@@ -2048,6 +2237,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
       if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
+        // DGG-5109 (AC-3): same external rate-limit retry_now branch for
+        // continuation recovery — without it the upstream provider quota path
+        // never reaches the ladder, so each cron tick re-escalates instead of
+        // honouring the 5m → 15m → 1h waits.
+        if (externalRateLimitBackoff.kind === "retry_now") {
+          if (await isInvocationBudgetBlocked(issue, agentId)) {
+            result.skipped += 1;
+            continue;
+          }
+
+          const queued = await enqueueStrandedIssueRecovery({
+            issueId: issue.id,
+            agentId,
+            reason: "issue_continuation_needed",
+            retryReason: "issue_continuation_needed",
+            source: EXTERNAL_RATE_LIMIT_RECOVERY_REASON,
+            retryOfRunId: latestRun!.id,
+          });
+          if (queued) {
+            result.continuationRequeued += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
         const failureSummary = summarizeRunFailureForIssueComment(latestRun);
         const updated = await escalateStrandedAssignedIssue({
           issue,
