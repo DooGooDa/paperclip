@@ -502,12 +502,9 @@ describe("openclaw gateway adapter execute", () => {
       );
       expect(String(payload?.message ?? "")).toContain("First comment");
       expect(String(payload?.message ?? "")).toContain("\"commentIds\":[\"comment-1\",\"comment-2\"]");
-      expect(payload?.paperclip).toMatchObject({
-        wake: {
-          latestCommentId: "comment-2",
-          commentIds: ["comment-1", "comment-2"],
-        },
-      });
+      // OpenClaw enforces strict agent param validation; the `paperclip` root key
+      // is rejected. Metadata is propagated via the `message` field instead.
+      expect(payload?.paperclip).toBeUndefined();
 
       expect(logs.some((entry) => entry.includes("[openclaw-gateway:event] run=run-123 stream=assistant"))).toBe(true);
     } finally {
