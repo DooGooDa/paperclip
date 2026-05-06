@@ -5,14 +5,26 @@ import {
 } from "../services/issue-goal-fallback.ts";
 
 describe("issue goal fallback", () => {
-  it("assigns the company goal when creating an issue without project or goal", () => {
+  it("assigns the company goal when creating an issue with no project/goal keys", () => {
+    expect(
+      resolveIssueGoalId({
+        projectId: undefined,
+        goalId: undefined,
+        defaultGoalId: "goal-1",
+      }),
+    ).toBe("goal-1");
+  });
+
+  it("skips the default goal when client explicitly sends projectId=null and goalId=null", () => {
+    // Explicit unattached intent (e.g., daily smoke drill TEST issue paths).
+    // The client opted out of any project/goal, so the server must not auto-attach.
     expect(
       resolveIssueGoalId({
         projectId: null,
         goalId: null,
         defaultGoalId: "goal-1",
       }),
-    ).toBe("goal-1");
+    ).toBeNull();
   });
 
   it("keeps an explicit goal when creating an issue", () => {
