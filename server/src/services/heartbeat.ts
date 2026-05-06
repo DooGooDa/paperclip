@@ -7726,6 +7726,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         };
       }
 
+      // DGG-5392: same-source dedup must apply to the heartbeat retry path
+      // too. DGG-5210 only wired `isSameSourceRetryDuplicate` into the
+      // reconcile cron in recovery/service.ts. The terminal-run release path
+      // here also requeues automatic recovery (source =
+      // `issue.{assignment,continuation}_recovery`), so without this gate two
+      // process_lost terminations 48m apart slip through the 1h dedup window
+      // and bypass the cap+dedup contract. Use the same fingerprint helper
+      // exported from recovery service so cap/dedup remain a single SSOT.
+      if (await recovery.isSameSourceRetryDuplicate(issue.companyId, issue.id, run, new Date())) {
+        return { kind: "released" as const };
+      }
+
       const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
       const recoveryReason = issue.status === "todo" ? "issue_assignment_recovery" : "issue_continuation_needed";
       const recoverySource =

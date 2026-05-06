@@ -3088,5 +3088,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
+    // DGG-5392: expose dedup gate so heartbeat's releaseIssueExecutionAndPromote
+    // can apply the same fingerprint guard as the reconcile path (single SSOT).
+    isSameSourceRetryDuplicate,
   };
 }

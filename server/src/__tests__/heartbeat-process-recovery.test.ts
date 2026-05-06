@@ -932,6 +932,93 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.checkoutRunId).toBe(runId);
   });
 
+  // DGG-5392: same-source dedup must apply to the heartbeat retry path too,
+  // not only to the reconcile cron. When `reapOrphanedRuns` finalizes a
+  // process_lost run and calls `releaseIssueExecutionAndPromote`, the gate
+  // should suppress an immediate retry whose fingerprint matches another
+  // automatic recovery run inside the 1h dedup window. Otherwise the cap+dedup
+  // contract from DGG-5210 has a hole — two process_lost terminations 48m
+  // apart slip through the same-source dedup window. Uses the same fingerprint
+  // helper exported from recovery service so SSOT is preserved.
+  it("DGG-5392: skips heartbeat retry queue when same-source dedup matches a recent automatic recovery run", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+      runErrorCode: "process_lost",
+      runError: "Lost in-memory process handle",
+    });
+    // Re-stamp the seed run into the live 1h dedup window — recovery uses
+    // real-time `now`, not the fixture's anchored 2026-03-19 date.
+    const nowMs = Date.now();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        startedAt: new Date(nowMs - 5 * 60 * 1000),
+        updatedAt: new Date(nowMs - 5 * 60 * 1000),
+        createdAt: new Date(nowMs - 5 * 60 * 1000),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    // Insert a prior automatic recovery run with the same fingerprint inside
+    // the dedup window. retryReason = `issue_continuation_needed` matches
+    // `isAutomaticStrandedRecoveryRetryReason` so the dedup gate considers it.
+    const earlierRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: earlierRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+      },
+      startedAt: new Date(nowMs - 30 * 60 * 1000),
+      finishedAt: new Date(nowMs - 29 * 60 * 1000),
+      createdAt: new Date(nowMs - 30 * 60 * 1000),
+      updatedAt: new Date(nowMs - 29 * 60 * 1000),
+      errorCode: "process_lost",
+      error: "Lost in-memory process handle",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    // The seed run is now `failed` (process_lost). The dedup gate should
+    // prevent a *new* retry from being queued — total run count stays at 2
+    // (seed + earlier prior run) instead of 3 (seed + earlier + new retry).
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs).toHaveLength(2);
+    const ids = runs.map((row) => row.id).sort();
+    expect(ids).toEqual([runId, earlierRunId].sort());
+    const failedRun = runs.find((row) => row.id === runId);
+    expect(failedRun?.status).toBe("failed");
+    expect(failedRun?.errorCode).toBe("process_lost");
+
+    // Issue lock is released (executionRunId cleared) so reconcile can pick
+    // it up next cron tick. Status stays in_progress — dedup is silent;
+    // cap path will eventually escalate after the 24h budget exhausts.
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.executionRunId).toBeNull();
+
+    // No new comment from the dedup gate (silent by design).
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+  });
+
   it("releases active environment leases when an orphaned run is reaped", async () => {
     const { runId, issueId, companyId } = await seedRunFixture({
       processPid: 999_999_999,
