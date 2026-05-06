@@ -1136,7 +1136,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+  // OpenClaw ≥2026.5.x enforces strict object validation on agent params and
+  // rejects unknown top-level keys ("invalid agent params: at root: unexpected
+  // property 'paperclip'"). The legacy adapter set `agentParams.paperclip` as a
+  // top-level key carrying Paperclip-specific metadata (runId, agentId, issueId,
+  // wakeReason, ...), which is no longer schema-compatible.
+  //
+  // We also cannot stash it inside `inputProvenance` because that is itself a
+  // strict object on the gateway side. The only generously-typed slot available
+  // is `extraSystemPrompt: TString`, so we encode the payload as a JSON-tagged
+  // sentinel inside extraSystemPrompt that downstream consumers can parse. Most
+  // agents read paperclip context out of band (env / API), so dropping the
+  // top-level field is a no-op for the dispatch path itself.
+  delete agentParams.paperclip;
+  const sentinel = `<!--PAPERCLIP_PAYLOAD_V1 ${JSON.stringify(paperclipPayload)} -->`;
+  const existingExtraSystemPrompt = nonEmpty(agentParams.extraSystemPrompt);
+  agentParams.extraSystemPrompt = existingExtraSystemPrompt
+    ? `${existingExtraSystemPrompt}\n${sentinel}`
+    : sentinel;
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
