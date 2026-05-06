@@ -420,7 +420,11 @@ function buildWakeText(
     "   - POST /api/issues/{issueId}/checkout with {\"agentId\":\"$PAPERCLIP_AGENT_ID\",\"expectedStatuses\":[\"todo\",\"backlog\",\"blocked\",\"in_review\"]}",
     "   - GET /api/issues/{issueId}",
     "   - GET /api/issues/{issueId}/comments",
-    "   - Execute the issue instructions exactly.",
+    "   - Execute the issue instructions exactly. If the issue is actionable, take concrete action in this run; do not stop at a plan unless planning was requested.",
+    "   - Leave durable progress with a clear next action. Use child issues for long or parallel delegated work instead of polling agents, sessions, or processes.",
+    "   - Create child issues directly when you know what needs to be done; use POST /api/issues/{issueId}/interactions with kind suggest_tasks, ask_user_questions, or request_confirmation when the board/user must choose, answer, or confirm before you can continue.",
+    "   - For plan approval, update the plan document first, then create request_confirmation targeting the latest plan revision with idempotencyKey confirmation:{issueId}:plan:{revisionId}; wait for acceptance before creating implementation subtasks.",
+    "   - If blocked, PATCH /api/issues/{issueId} with {\"status\":\"blocked\",\"comment\":\"what is blocked, who owns the unblock, and the next action\"}.",
     "   - If instructions require a comment, POST /api/issues/{issueId}/comments with {\"body\":\"...\"}.",
     "   - PATCH /api/issues/{issueId} with {\"status\":\"done\",\"comment\":\"what changed and why\"}.",
     "4) If issueId does not exist:",
@@ -1132,7 +1136,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+  // OpenClaw ≥2026.5.x enforces strict object validation on agent params and
+  // rejects unknown top-level keys ("invalid agent params: at root: unexpected
+  // property 'paperclip'"). The legacy adapter set `agentParams.paperclip` as a
+  // top-level key carrying Paperclip-specific metadata (runId, agentId, issueId,
+  // wakeReason, ...), which is no longer schema-compatible.
+  //
+  // We also cannot stash it inside `inputProvenance` because that is itself a
+  // strict object on the gateway side. The only generously-typed slot available
+  // is `extraSystemPrompt: TString`, so we encode the payload as a JSON-tagged
+  // sentinel inside extraSystemPrompt that downstream consumers can parse. Most
+  // agents read paperclip context out of band (env / API), so dropping the
+  // top-level field is a no-op for the dispatch path itself.
+  delete agentParams.paperclip;
+  const sentinel = `<!--PAPERCLIP_PAYLOAD_V1 ${JSON.stringify(paperclipPayload)} -->`;
+  const existingExtraSystemPrompt = nonEmpty(agentParams.extraSystemPrompt);
+  agentParams.extraSystemPrompt = existingExtraSystemPrompt
+    ? `${existingExtraSystemPrompt}\n${sentinel}`
+    : sentinel;
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
