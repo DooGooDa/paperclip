@@ -1127,7 +1127,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const templateMessage = nonEmpty(payloadTemplate.message) ?? nonEmpty(payloadTemplate.text);
   const message = templateMessage ? appendWakeText(templateMessage, wakeText) : wakeText;
-  const paperclipPayload = buildStandardPaperclipPayload(ctx, wakePayload, paperclipEnv, payloadTemplate);
 
   const agentParams: Record<string, unknown> = {
     ...payloadTemplate,
@@ -1136,14 +1135,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  // OpenClaw Gateway enforces strict agent param validation and rejects unknown
-  // root keys ("invalid agent params: at root: unexpected property 'paperclip'").
-  // The paperclip metadata is already encoded into the message field via
-  // wakeText/PAPERCLIP_* env vars, so we must not send it as a separate root key.
-  // Re-introducing this line will immediately blackhole every routine_execution
-  // dispatch into blocked + spawn stranded_issue_recovery sub-issues. Keep it removed.
-  // (Originally fixed by 6c9e639a; re-added during a later upstream merge — do not reintroduce.)
-  // agentParams.paperclip = paperclipPayload;
+  // Defense-in-depth: payloadTemplate (line 1133 spread) may still carry a
+  // `paperclip` key sourced from agents.adapter_config or upstream object merges.
+  // OpenClaw Gateway rejects unknown root keys ("invalid agent params: at root:
+  // unexpected property 'paperclip'"). Removing the *assignment* (history below)
+  // is not enough — the spread itself can leak it. Always delete after spread.
+  // History: 6c9e639a removed `agentParams.paperclip = paperclipPayload`,
+  //          re-added during upstream merge,
+  //          e819cdad removed it again. This defensive delete prevents the
+  //          third regression and any future spread-source leak.
+  delete agentParams.paperclip;
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
