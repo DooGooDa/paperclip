@@ -100,11 +100,18 @@ export interface InboxGroupedSection {
 
 export interface InboxKeyboardGroupSection {
   key: string;
+  label?: string | null;
   displayItems: InboxWorkItem[];
   childrenByIssueId: ReadonlyMap<string, Issue[]>;
 }
 
 export type InboxKeyboardNavEntry =
+  | {
+      type: "group";
+      groupKey: string;
+      label: string;
+      collapsed: boolean;
+    }
   | {
       type: "top";
       itemKey: string;
@@ -438,6 +445,7 @@ export function getInboxSearchSupplementIssues({
   issueFilters,
   currentUserId,
   enableRoutineVisibilityFilter = false,
+  liveIssueIds,
 }: {
   query: string;
   filteredWorkItems: InboxWorkItem[];
@@ -446,6 +454,7 @@ export function getInboxSearchSupplementIssues({
   issueFilters: IssueFilterState;
   currentUserId?: string | null;
   enableRoutineVisibilityFilter?: boolean;
+  liveIssueIds?: ReadonlySet<string>;
 }): Issue[] {
   const normalizedQuery = query.trim();
   if (!normalizedQuery) return [];
@@ -455,7 +464,7 @@ export function getInboxSearchSupplementIssues({
       .map((item) => item.issue.id),
     ...archivedSearchIssues.map((issue) => issue.id),
   ]);
-  return applyIssueFilters(remoteIssues, issueFilters, currentUserId, enableRoutineVisibilityFilter)
+  return applyIssueFilters(remoteIssues, issueFilters, currentUserId, enableRoutineVisibilityFilter, liveIssueIds)
     .filter((issue) => !visibleIssueIds.has(issue.id));
 }
 
@@ -706,11 +715,7 @@ export function getApprovalsForTab(
   );
 
   if (tab === "mine") {
-    if (!currentUserId) return [];
-    return sortedApprovals.filter(
-      (approval) =>
-        approval.requestedByUserId === currentUserId || approval.decidedByUserId === currentUserId,
-    );
+    return sortedApprovals.filter((approval) => isApprovalVisibleInMine(approval, currentUserId));
   }
   if (tab === "recent") return sortedApprovals;
   if (tab === "unread") {
@@ -722,6 +727,15 @@ export function getApprovalsForTab(
     const isActionable = ACTIONABLE_APPROVAL_STATUSES.has(approval.status);
     return filter === "actionable" ? isActionable : !isActionable;
   });
+}
+
+export function isApprovalVisibleInMine(
+  approval: Approval,
+  currentUserId?: string | null,
+): boolean {
+  if (ACTIONABLE_APPROVAL_STATUSES.has(approval.status)) return true;
+  if (!currentUserId) return false;
+  return approval.requestedByUserId === currentUserId || approval.decidedByUserId === currentUserId;
 }
 
 export function approvalActivityTimestamp(approval: Approval): number {
@@ -892,9 +906,26 @@ export function buildInboxNesting(items: InboxWorkItem[]): {
     }
   }
 
-  // Sort each child list by most recent activity
+  const subtreeActivityTimestamp = (issue: Issue, seen: ReadonlySet<string> = new Set()): number => {
+    const ownTimestamp = issueLastActivityTimestamp(issue);
+    if (seen.has(issue.id)) return ownTimestamp;
+    const nextSeen = new Set(seen);
+    nextSeen.add(issue.id);
+    const children = childrenByIssueId.get(issue.id) ?? [];
+    if (children.length === 0) return ownTimestamp;
+    return Math.max(
+      ownTimestamp,
+      ...children.map((child) => subtreeActivityTimestamp(child, nextSeen)),
+    );
+  };
+
+  // Sort each child list by most recent descendant activity, not just direct issue activity.
   for (const children of childrenByIssueId.values()) {
-    children.sort(sortIssuesByMostRecentActivity);
+    children.sort((a, b) => {
+      const activityDiff = subtreeActivityTimestamp(b) - subtreeActivityTimestamp(a);
+      if (activityDiff !== 0) return activityDiff;
+      return sortIssuesByMostRecentActivity(a, b);
+    });
   }
 
   // Build root issue items with group-adjusted timestamps
@@ -903,7 +934,7 @@ export function buildInboxNesting(items: InboxWorkItem[]): {
     .map((item) => {
       const children = childrenByIssueId.get(item.issue.id);
       if (!children?.length) return item;
-      const maxChildTs = Math.max(...children.map(issueLastActivityTimestamp));
+      const maxChildTs = Math.max(...children.map((child) => subtreeActivityTimestamp(child)));
       return { ...item, timestamp: Math.max(item.timestamp, maxChildTs) };
     });
 
@@ -960,7 +991,33 @@ export function buildInboxKeyboardNavEntries(
   const entries: InboxKeyboardNavEntry[] = [];
 
   for (const group of groupedSections) {
-    if (collapsedGroupKeys.has(group.key)) continue;
+    const isCollapsed = collapsedGroupKeys.has(group.key);
+    if (group.label) {
+      entries.push({
+        type: "group",
+        groupKey: group.key,
+        label: group.label,
+        collapsed: isCollapsed,
+      });
+    }
+    if (isCollapsed) continue;
+
+    const addIssueChildren = (issueId: string, seen: ReadonlySet<string>) => {
+      const children = group.childrenByIssueId.get(issueId);
+      if (!children?.length || collapsedInboxParents.has(issueId)) return;
+
+      for (const child of children) {
+        if (seen.has(child.id)) continue;
+        const nextSeen = new Set(seen);
+        nextSeen.add(child.id);
+        entries.push({
+          type: "child",
+          issueId: child.id,
+          issue: child,
+        });
+        addIssueChildren(child.id, nextSeen);
+      }
+    };
 
     for (const item of group.displayItems) {
       entries.push({
@@ -970,17 +1027,7 @@ export function buildInboxKeyboardNavEntries(
       });
 
       if (item.kind !== "issue") continue;
-
-      const children = group.childrenByIssueId.get(item.issue.id);
-      if (!children?.length || collapsedInboxParents.has(item.issue.id)) continue;
-
-      for (const child of children) {
-        entries.push({
-          type: "child",
-          issueId: child.id,
-          issue: child,
-        });
-      }
+      addIssueChildren(item.issue.id, new Set([item.issue.id]));
     }
   }
 
@@ -1030,8 +1077,7 @@ export function computeInboxBadgeData({
 }): InboxBadgeData {
   const actionableApprovals = approvals.filter(
     (approval) =>
-      !!currentUserId &&
-      (approval.requestedByUserId === currentUserId || approval.decidedByUserId === currentUserId) &&
+      isApprovalVisibleInMine(approval, currentUserId) &&
       ACTIONABLE_APPROVAL_STATUSES.has(approval.status) &&
       !isInboxEntityDismissed(dismissedAtByKey, `approval:${approval.id}`, approval.updatedAt),
   ).length;
