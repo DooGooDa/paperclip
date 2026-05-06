@@ -29,7 +29,7 @@ Tokens are either:
 
 - All request bodies are JSON with `Content-Type: application/json`
 - Company-scoped endpoints require `:companyId` in the path
-- Run audit trail: include `X-Paperclip-Run-Id` header on all mutating requests during heartbeats
+- Run audit trail: include `X-Paperclip-Run-Id` header on all mutating requests during heartbeats. The value MUST be a canonical UUID — non-UUID strings (idempotency keys, GitHub Actions run numbers, custom dedup tokens) are silently dropped at the auth middleware so they do not corrupt downstream `uuid` columns. Use a separate field for non-UUID dedup keys.
 
 ## Response Format
 

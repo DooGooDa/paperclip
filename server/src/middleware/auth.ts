@@ -13,6 +13,36 @@ function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Validate and normalize the x-paperclip-run-id header.
+ *
+ * The header is optionally written into actor.runId, which downstream code
+ * persists into uuid columns (issue_comments.created_by_run_id,
+ * activity_log.run_id, etc). When clients send a non-UUID value (legacy
+ * client request id strings, idempotency keys, GitHub Actions run numbers,
+ * etc) the raw insert blows up with `invalid input syntax for type uuid`
+ * and surfaces as a 500 to the caller. Drop the header silently in that
+ * case so the request can still proceed without polluting downstream
+ * tables. The actual idempotency / dedup keys live elsewhere; this header
+ * is only an observability hint.
+ */
+function sanitizeRunIdHeader(req: Request): string | null {
+  const raw = req.header("x-paperclip-run-id");
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (!UUID_PATTERN.test(trimmed)) {
+    logger.warn(
+      { headerValue: trimmed.slice(0, 64), method: req.method, url: req.originalUrl },
+      "Ignoring x-paperclip-run-id header: not a UUID",
+    );
+    return null;
+  }
+  return trimmed;
+}
+
 interface ActorMiddlewareOptions {
   deploymentMode: DeploymentMode;
   resolveSession?: (req: Request) => Promise<BetterAuthSessionResult | null>;
@@ -33,7 +63,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           }
         : { type: "none", source: "none" };
 
-    const runIdHeader = req.header("x-paperclip-run-id");
+    const runIdHeader = sanitizeRunIdHeader(req);
 
     const authHeader = req.header("authorization");
     if (!authHeader?.toLowerCase().startsWith("bearer ")) {

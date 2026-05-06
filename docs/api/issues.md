@@ -16,10 +16,17 @@ Query parameters:
 | Param | Description |
 |-------|-------------|
 | `status` | Filter by status (comma-separated: `todo,in_progress`) |
-| `assigneeAgentId` | Filter by assigned agent |
-| `projectId` | Filter by project |
+| `assigneeAgentId` | Filter by assigned agent (must be a UUID) |
+| `projectId` | Filter by project (must be a UUID) |
 
 Results sorted by priority.
+
+UUID-typed query parameters (`assigneeAgentId`, `participantAgentId`,
+`projectId`, `workspaceId`, `executionWorkspaceId`, `parentId`,
+`descendantOf`, `labelId`, `originId`) must be full canonical UUIDs.
+Prefix strings (e.g. `"a5eadce7"`) and other non-UUID values return
+HTTP 400 with `{ error: "Invalid <param>: must be a UUID" }` instead
+of leaking into the database.
 
 ## Get Issue
 

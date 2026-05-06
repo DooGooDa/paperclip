@@ -946,9 +946,37 @@ export function issueRoutes(
     });
   });
 
+  // UUID-typed query parameters that drizzle eq()s straight against pg uuid
+  // columns. Without zod validation, prefix strings ("5d676414") leak into
+  // PostgreSQL and surface as 500 "invalid input syntax for type uuid".
+  // Validate up front so the caller gets a 400 instead.
+  const UUID_QUERY_PARAMS = [
+    "assigneeAgentId",
+    "participantAgentId",
+    "projectId",
+    "workspaceId",
+    "executionWorkspaceId",
+    "parentId",
+    "descendantOf",
+    "labelId",
+    "originId",
+  ] as const;
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
   router.get("/companies/:companyId/issues", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
+    for (const key of UUID_QUERY_PARAMS) {
+      const value = req.query[key];
+      if (value === undefined || value === null || value === "") continue;
+      if (typeof value !== "string" || !UUID_RE.test(value)) {
+        res.status(400).json({
+          error: `Invalid ${key}: must be a UUID`,
+          details: { param: key, received: typeof value === "string" ? value.slice(0, 64) : typeof value },
+        });
+        return;
+      }
+    }
     const assigneeUserFilterRaw = req.query.assigneeUserId as string | undefined;
     const touchedByUserFilterRaw = req.query.touchedByUserId as string | undefined;
     const inboxArchivedByUserFilterRaw = req.query.inboxArchivedByUserId as string | undefined;
