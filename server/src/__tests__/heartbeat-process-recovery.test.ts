@@ -2622,4 +2622,82 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       payload: expect.objectContaining({ issueId }),
     });
   });
+
+  it("excludes routine_execution issues from reconcile candidates (DGG-5143 dup-wake loop)", async () => {
+    // Reproduces DGG-5143 pattern: every cron tick re-creates a routine_execution issue
+    // (status=todo, assigned to the routine owner). Before the fix, reconcile would
+    // immediately treat it as stranded — producing a stranded_issue_recovery sub-issue
+    // and flipping the parent to status=blocked the same instant, even though the agent
+    // had not yet been woken to do the work. The result was a permanent dup-wake loop
+    // (every :05 / :15 / :20 / :35 tick added a new pair of blocked issues).
+    //
+    // The fix excludes originKind='routine_execution' from the reconcile candidate
+    // SELECT entirely. The routine scheduler is the live execution path for these
+    // dispatch shells; reconciliation can only generate noise.
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
+
+    // Mark the seeded issue as a routine_execution dispatch shell, identical to what
+    // routineRunIssueCreator emits at every cron tick.
+    await db.update(issues).set({ originKind: "routine_execution" }).where(eq(issues.id, issueId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Must NOT be picked up: zero dispatch, zero requeue, zero escalation, zero issueIds.
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toHaveLength(0);
+
+    // No recovery sub-issue should have been spawned.
+    const recoveries = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveries).toHaveLength(0);
+
+    // No recovery wakeup should have been enqueued.
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.companyId, companyId)));
+    expect(wakeups).toHaveLength(0);
+
+    // Parent issue must remain todo — the dup-wake loop required it to flip to blocked.
+    const parent = await db.select().from(issues).where(eq(issues.id, issueId)).limit(1);
+    expect(parent[0]?.status).toBe("todo");
+  });
+
+  it("still reconciles non-routine_execution issues (manual origin remains in scope)", async () => {
+    // Negative control for the DGG-5143 fix: a manual-origin issue (or null origin) with the
+    // same other attributes must still be picked up, so we do not silently disable reconcile
+    // for legitimate stranded work.
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
+
+    // originKind defaults to null/manual via fixture — leave it untouched.
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // Should be picked up and dispatched, exactly like the existing assigned-todo path.
+    expect(result.assignmentDispatched).toBe(1);
+    expect(result.skipped).toBe(0);
+
+    const wakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.companyId, companyId)));
+    expect(wakeups).toHaveLength(1);
+    expect(wakeups[0]).toMatchObject({
+      reason: "issue_assigned",
+      payload: expect.objectContaining({ issueId }),
+    });
+  });
 });
