@@ -2615,6 +2615,218 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("`blocked`");
   });
 
+  // DGG-5548 (AC-1): ensureStrandedIssueRecoveryIssue must not create a
+  // second recovery sub-issue for the same source within the 1h dedup
+  // window, even when the first sub-issue is already `done`. The bug:
+  // findOpenStrandedIssueRecoveryIssue excludes done/cancelled, and the
+  // run-level cap inside reconcile counts *runs* not *creations*, so each
+  // reopen→reconcile cycle could spawn a brand-new sub-issue at 11~12min
+  // intervals. Repro:
+  //   1. Source goes stranded → reconcile creates sub-issue #1.
+  //   2. Sub-issue #1 done (manual or AC-3 auto-done).
+  //   3. New stale run for the same source 11min later.
+  //   4. Reconcile must reuse sub-issue #1, not create #2.
+  it("DGG-5548 AC-1: same-source recovery sub-issue creation is deduped within the 1h window even when the prior sub-issue is done", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "process_lost",
+      runError: "Lost in-memory process handle",
+    });
+    // Re-stamp the seed run so it sits inside the live dedup window
+    // (reconcile uses real-time `now`, the fixture anchors to 2026-03-19).
+    const nowMs = Date.now();
+    const seedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!seedRun) throw new Error("expected seed heartbeat run");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        startedAt: new Date(nowMs - 60_000),
+        finishedAt: new Date(nowMs - 30_000),
+        createdAt: new Date(nowMs - 60_000),
+        updatedAt: new Date(nowMs - 30_000),
+      })
+      .where(eq(heartbeatRuns.id, seedRun.id));
+
+    // First reconcile: creates sub-issue #1.
+    const heartbeat = heartbeatService(db);
+    const firstResult = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(firstResult.escalated).toBe(1);
+
+    const recoveriesAfterFirst = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveriesAfterFirst).toHaveLength(1);
+    const firstRecoveryId = recoveriesAfterFirst[0]!.id;
+
+    // Mark sub-issue #1 as `done` to simulate manual close or AC-3 auto-done.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, firstRecoveryId));
+
+    // Source comment-PATCHed back to in_progress for the next stale run.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+
+    // 11 minutes later: a new stale run with a *different* fingerprint
+    // (latestRunId B) — without the creation-time dedup, this would spawn
+    // a brand-new sub-issue. Insert the new failed run inside the 1h dedup
+    // window so reconcile picks it as the latest run.
+    const laterRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: laterRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+      },
+      // Use a *different* errorCode so the same-source-run dedup gate does
+      // NOT fire — this exercises the recovery-issue creation dedup
+      // exclusively.
+      errorCode: "adapter_exit_code",
+      error: "adapter exited unexpectedly",
+      startedAt: new Date(nowMs + 11 * 60_000),
+      finishedAt: new Date(nowMs + 11 * 60_000 + 30_000),
+      createdAt: new Date(nowMs + 11 * 60_000),
+      updatedAt: new Date(nowMs + 11 * 60_000 + 30_000),
+    });
+
+    // Second reconcile: must reuse the existing (done) sub-issue, not
+    // create a new one.
+    const secondResult = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(secondResult.recoveryIssueCreationDeduped).toBeGreaterThanOrEqual(1);
+
+    const recoveriesAfterSecond = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    // Still exactly one recovery sub-issue — same-source 1h dedup held
+    // across the closed→reopen cycle.
+    expect(recoveriesAfterSecond).toHaveLength(1);
+    expect(recoveriesAfterSecond[0]?.id).toBe(firstRecoveryId);
+    // Suppress unused-variable lint when runId is only consumed by the
+    // fixture for log identity.
+    void runId;
+  });
+
+  // DGG-5548 / DGG-5493: source-based dedup on the recovery sub-issue
+  // creation path. The DGG-5210 run-level cap+dedup operates on heartbeat
+  // runs; it does NOT bound how often `ensureStrandedIssueRecoveryIssue`
+  // can spawn a brand-new sub-issue when the previous one already closed
+  // (auto-done by AC-3 or manually). Without this guard, the loop is:
+  //   1. reconcile escalates source -> blocked, creates sub-issue.
+  //   2. AC-3 auto-dones the sub-issue (or operator closes it).
+  //   3. source flips back to in_progress (comment-PATCH).
+  //   4. next reconcile tick sees no OPEN sub-issue and creates a new one.
+  // The new gate reuses any sub-issue (regardless of status) created in
+  // the last STRANDED_RECOVERY_SAME_SOURCE_DEDUP_WINDOW_MS (1h).
+  // Evidence trail: DGG-5419 -> DGG-5495+5498 (12min apart),
+  // DGG-5464 -> DGG-5487+5499 (12min apart) on 2026-05-06.
+  it("DGG-5548: skips recovery sub-issue creation when one was already created for the same source inside the dedup window", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "process_lost",
+      runError: "Lost in-memory process handle",
+    });
+    const nowMs = Date.now();
+    // Anchor the seed run inside the live 24h window so the cap path does
+    // not pre-empt the creation-dedup gate we are exercising.
+    const seedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!seedRun) throw new Error("expected seed heartbeat run");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        startedAt: new Date(nowMs - 5 * 60 * 1000),
+        finishedAt: new Date(nowMs - 4 * 60 * 1000),
+        createdAt: new Date(nowMs - 5 * 60 * 1000),
+        updatedAt: new Date(nowMs - 4 * 60 * 1000),
+      })
+      .where(eq(heartbeatRuns.id, seedRun.id));
+
+    // Seed an already-done recovery sub-issue created 12min ago for the
+    // same source (matches the real DGG-5419 -> DGG-5495+5498 cadence).
+    const priorRecoveryId = randomUUID();
+    const priorRecoveryCreatedAt = new Date(nowMs - 12 * 60 * 1000);
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: priorRecoveryId,
+      companyId,
+      title: "Recover stalled issue (prior)",
+      status: "done",
+      priority: "medium",
+      issueNumber: 99,
+      identifier: `${issuePrefix}-99`,
+      assigneeAgentId: agentId,
+      originKind: "stranded_issue_recovery",
+      originId: issueId,
+      createdAt: priorRecoveryCreatedAt,
+      updatedAt: priorRecoveryCreatedAt,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    // Source still escalates (existing behavior preserved); the dedup gate
+    // only suppresses the duplicate sub-issue creation, not the source
+    // status transition.
+    expect(result.escalated).toBe(1);
+    expect(result.recoveryIssueCreationDeduped).toBe(1);
+    expect(result.recoveryIssueCreationCapped).toBe(0);
+
+    // Only the prior (done) recovery sub-issue exists — no new one was
+    // created.
+    const recoveries = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(recoveries).toHaveLength(1);
+    expect(recoveries[0]?.id).toBe(priorRecoveryId);
+    expect(recoveries[0]?.status).toBe("done");
+
+    const sourceIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("blocked");
+  });
+
   // DGG-5210 (AC-3): a recovery issue ("Recover stalled issue ...") whose
   // latest run finished successfully with productive liveness should be
   // auto-marked `done`, not fed back into another stranded-recovery loop.
