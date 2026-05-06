@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { and, eq, or, inArray } from "drizzle-orm";
+import { and, desc, eq, or, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -2357,5 +2357,219 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(runs).toHaveLength(1);
+  });
+
+  // DGG-5210 (AC-1): same-source dedup. When the latest failed run for an
+  // issue has the same `errorCode` as another automatic recovery run inside
+  // the 1h dedup window, reconcile must skip a fresh retry instead of
+  // emitting yet another "Paperclip retried..." comment loop. The fixture
+  // anchors run timestamps near `Date.now()` so the dedup window
+  // (now - 1h) actually contains them — reconcile uses real-time `now`.
+  it("DGG-5210 AC-1: skips a same-source automatic recovery retry inside the 1h dedup window", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "openclaw_gateway_wait_error",
+      runError: "OpenClaw gateway exhausted",
+    });
+    // Re-stamp the seed fixture run into the live dedup window, then insert
+    // a prior automatic recovery run with the same fingerprint, also inside
+    // the live 1h window but earlier than the seed run.
+    const nowMs = Date.now();
+    const seedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!seedRun) throw new Error("expected seed heartbeat run");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        startedAt: new Date(nowMs - 5 * 60 * 1000),
+        finishedAt: new Date(nowMs - 4 * 60 * 1000),
+        createdAt: new Date(nowMs - 5 * 60 * 1000),
+        updatedAt: new Date(nowMs - 4 * 60 * 1000),
+      })
+      .where(eq(heartbeatRuns.id, seedRun.id));
+
+    const earlierRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: earlierRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "failed",
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+      },
+      startedAt: new Date(nowMs - 30 * 60 * 1000),
+      finishedAt: new Date(nowMs - 29 * 60 * 1000),
+      createdAt: new Date(nowMs - 30 * 60 * 1000),
+      updatedAt: new Date(nowMs - 29 * 60 * 1000),
+      errorCode: "openclaw_gateway_wait_error",
+      error: "OpenClaw gateway exhausted",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+    expect(result.sameSourceDedupSkipped).toBe(1);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+
+    // Issue stays in_progress — cap path will surface it once the budget
+    // exhausts; same-source dedup alone never escalates.
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    // No new comment was emitted (the dedup gate is silent by design).
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+
+    // Earlier and latest runs both still exist; no new recovery run was queued.
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, earlierRunId));
+    expect(runs).toHaveLength(1);
+  });
+
+  // DGG-5210 (AC-2): cap automatic stranded-recovery retries at 3 inside 24h.
+  // The cap triggers the existing escalateStrandedAssignedIssue path with a
+  // cap-specific comment so the activity log SSOT records the escalation.
+  // Run timestamps are anchored near `Date.now()` so the live 24h window
+  // contains them; reconcile uses real-time `now`.
+  it("DGG-5210 AC-2: escalates an issue to blocked once 3 automatic recovery attempts are consumed inside 24h", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "openclaw_gateway_wait_error",
+      runError: "OpenClaw gateway exhausted",
+    });
+    const nowMs = Date.now();
+    const seedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, companyId))
+      .orderBy(desc(heartbeatRuns.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (!seedRun) throw new Error("expected seed heartbeat run");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        startedAt: new Date(nowMs - 5 * 60 * 1000),
+        finishedAt: new Date(nowMs - 4 * 60 * 1000),
+        createdAt: new Date(nowMs - 5 * 60 * 1000),
+        updatedAt: new Date(nowMs - 4 * 60 * 1000),
+      })
+      .where(eq(heartbeatRuns.id, seedRun.id));
+    // Seed two additional prior automatic recovery runs so the cap of 3 is
+    // already consumed when reconcile runs (latest run + 2 historical = 3).
+    for (let i = 0; i < 2; i += 1) {
+      const priorRunId = randomUUID();
+      const priorMs = nowMs - (60 + i * 30) * 60 * 1000;
+      await db.insert(heartbeatRuns).values({
+        id: priorRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+        },
+        startedAt: new Date(priorMs),
+        finishedAt: new Date(priorMs + 5 * 60 * 1000),
+        createdAt: new Date(priorMs),
+        updatedAt: new Date(priorMs + 5 * 60 * 1000),
+        // Distinct error codes so the same-source dedup gate doesn't fire
+        // before the cap path; cap counts every automatic recovery attempt.
+        errorCode: `transient_${i}`,
+        error: `transient retry ${i}`,
+      });
+    }
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(1);
+    expect(result.capEscalated).toBe(1);
+    expect(result.sameSourceDedupSkipped).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("consumed 3 automatic recovery attempts inside 24h");
+    expect(comments[0]?.body).toContain("`blocked`");
+  });
+
+  // DGG-5210 (AC-3): a recovery issue ("Recover stalled issue ...") whose
+  // latest run finished successfully with productive liveness should be
+  // auto-marked `done`, not fed back into another stranded-recovery loop.
+  it("DGG-5210 AC-3: auto-marks a recovery issue done when its latest retry run succeeded productively", async () => {
+    const sourceIssueId = randomUUID();
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Original stranded source",
+      status: "blocked",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    await db
+      .update(issues)
+      .set({
+        title: "Recover stalled issue PAP-1",
+        originKind: "stranded_issue_recovery",
+        originId: sourceIssueId,
+      })
+      .where(eq(issues.id, issueId));
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId,
+      relatedIssueId: sourceIssueId,
+      type: "blocks",
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.recoveryAutoDone).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const recoveryIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(recoveryIssue?.status).toBe("done");
+    expect(recoveryIssue?.assigneeAgentId).toBe(agentId);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("auto-resolved this recovery issue");
+    expect(comments[0]?.body).toContain("`done`");
+
+    // Source issue keeps its own lifecycle — auto-done acts only on the
+    // recovery issue.
+    const source = await db.select().from(issues).where(eq(issues.id, sourceIssueId)).then((rows) => rows[0] ?? null);
+    expect(source?.status).toBe("blocked");
   });
 });
