@@ -53,3 +53,39 @@ Track task progress through:
 - **Status changes** — visible in the activity log
 - **Dashboard** — shows task counts by status and highlights stale work
 - **Run history** — see each heartbeat execution on the agent detail page
+
+## External-Dependency Issues (Scheduled Wake)
+
+Some `in_progress` issues are not actively driving an agent loop because they
+are waiting on an outside event (a CEO returning, a vendor confirmation, a
+scheduled API readiness window). The right pattern is to keep the issue
+`in_progress` and attach an active routine whose trigger fires on a future
+cron (`status=active`, `nextRunAt > now()`).
+
+The stranded-issue reconciler (`reconcileStrandedAssignedIssues`) treats this
+as a *live execution path* and skips the issue, so it will not be repeatedly
+classified as stranded and turned into recovery sub-issues.
+
+Live-execution-path inputs:
+
+1. An active heartbeat run for the issue.
+2. A `deferred_issue_execution` agent wakeup request.
+3. **An active routine bound to the issue with a future-scheduled trigger.**
+
+If none of those hold, the issue is reconciled as stranded.
+
+### Operator checklist for outside-dependency issues
+
+- Keep the issue in `in_progress` (do not park it in `blocked` unless a
+  human is actually required to unblock it).
+- Create or attach a routine whose `parentIssueId` is the issue id, with at
+  least one enabled trigger whose `nextRunAt` is in the future.
+- When the dependency resolves, transition the issue normally (or let the
+  routine wake the agent, which will pick it up via the assignment path).
+- If the routine is paused or its trigger expires, the issue *will* be
+  reconciled as stranded again — that is intentional. Re-arm the trigger
+  before relying on the schedule.
+
+This behaviour is enforced and regression-tested in
+`heartbeat-process-recovery.test.ts` (`DGG-5094: skips reconcile when issue
+has an active routine with a future-scheduled cron trigger`).
