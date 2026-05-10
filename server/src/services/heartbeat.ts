@@ -7681,7 +7681,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (issue.status === "todo" || issue.status === "in_progress") &&
         !issue.assigneeUserId &&
         issue.assigneeAgentId === run.agentId &&
-        (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
+        (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled") &&
+        // routine_execution issues are reborn every cron tick by routineRunIssueCreator.
+        // Treating them as stranded turns each gateway restart into a permanent blocked-issue
+        // pile-up (see reconcileStrandedAssignedIssues for the same exclusion + rationale).
+        issue.originKind !== "routine_execution";
 
       if (!issueNeedsImmediateRecovery) {
         return { kind: "released" as const };
