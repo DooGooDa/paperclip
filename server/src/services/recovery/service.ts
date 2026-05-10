@@ -1644,6 +1644,24 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) return null;
 
+    // DGG-7354: source-status pre-check.
+    // Refuse to spawn a stranded-recovery sub-issue when the source issue
+    // is already cancelled or done. The stranded-recovery loop assumes the
+    // source needs continuation; a closed source produces a recovery shell
+    // that the dispatcher immediately cancels (blocked-queue noise +
+    // cross-agent dup-wakes). Defense-in-depth: callers (escalateStranded…,
+    // reconcileStrandedAssignedIssues) also gate, but this path is the
+    // canonical creation entry so we lock the invariant here too.
+    if (input.issue.status === "cancelled" || input.issue.status === "done") {
+      logger.info({
+        sourceIssueId: input.issue.id,
+        sourceIdentifier: input.issue.identifier,
+        sourceStatus: input.issue.status,
+        skipReason: "source_status_closed",
+      }, "skipped stranded recovery issue creation: source already closed");
+      return null;
+    }
+
     const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
     if (existing) return existing;
 
@@ -1965,13 +1983,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       });
     }
 
-    const recoveryIssue = await ensureStrandedIssueRecoveryIssue({
-      issue: input.issue,
-      previousStatus: input.previousStatus,
-      latestRun: input.latestRun,
-      onCreationDeduped: input.onRecoveryIssueCreationDeduped,
-      onCreationCapped: input.onRecoveryIssueCreationCapped,
-    });
+    const recoveryIssue =
+      input.issue.status === "done" || input.issue.status === "cancelled"
+        ? null
+        : await ensureStrandedIssueRecoveryIssue({
+          issue: input.issue,
+          previousStatus: input.previousStatus,
+          latestRun: input.latestRun,
+          onCreationDeduped: input.onRecoveryIssueCreationDeduped,
+          onCreationCapped: input.onRecoveryIssueCreationCapped,
+        });
     const blockerIds = await existingUnresolvedBlockerIssueIds(input.issue.companyId, input.issue.id);
     const nextBlockerIds = recoveryIssue
       ? [...new Set([...blockerIds, recoveryIssue.id])]
@@ -2998,6 +3019,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .where(and(eq(issues.id, input.finding.recoveryIssueId), eq(issues.companyId, issue.companyId)))
       .then((rows) => rows[0] ?? null);
     if (!recoveryIssue) return { kind: "skipped" as const };
+
+    // DGG-7354: source-status pre-check.
+    // The blocker (recoveryIssue here) referenced by the liveness finding may have
+    // already been resolved (done) or intentionally retired (cancelled) by the time
+    // this escalation runs. Creating a new escalation issue against a closed source
+    // produces a unblock ghost — escalation gets cancelled immediately, leaving
+    // blocked-queue noise and dup-wakes for the recovery owner. Skip creation here
+    // and let the obsolete-recovery cleanup or blocker-relation reconcile drop the
+    // stale relation. The source issue's blocker will surface again on the next
+    // tick if it is genuinely live.
+    if (recoveryIssue.status === "cancelled" || recoveryIssue.status === "done") {
+      logger.info({
+        incidentKey: input.finding.incidentKey,
+        sourceIssueId: issue.id,
+        recoveryIssueId: recoveryIssue.id,
+        recoveryStatus: recoveryIssue.status,
+        skipReason: "source_status_closed",
+      }, "skipped issue graph liveness escalation: source already closed");
+      return { kind: "skipped" as const };
+    }
 
     const existing =
       await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??

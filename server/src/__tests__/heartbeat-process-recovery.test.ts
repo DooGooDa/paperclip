@@ -3206,4 +3206,80 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       );
     expect(subIssues).toHaveLength(3);
   });
+
+  // DGG-7354: source-status pre-check.
+  // Repro: source issue is cancelled (or done) by the time reconcile runs.
+  // Without the guard, ensureStrandedIssueRecoveryIssue spawns a new
+  // sub-issue against a closed source, the dispatcher then cancels it for
+  // lack of a recovery target, and the loop produces blocked-queue noise +
+  // cross-agent dup-wakes (DGG-6801 case, 2026-05-10).
+  it("DGG-7354: skips recovery sub-issue creation when the source issue is cancelled", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "process_lost",
+      runError: "Lost in-memory process handle",
+    });
+    // Flip the source to cancelled after the fixture seed (mirrors the
+    // production race where the source closes between the failure run and
+    // the reconcile tick).
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // The reconcile candidate set filters on status in (todo,in_progress),
+    // so a cancelled source is excluded entirely — no escalation, no new
+    // recovery sub-issue.
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    const subIssues = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(subIssues).toHaveLength(0);
+  });
+
+  // DGG-7354: same guard for done source.
+  // Reconcile already filters status in (todo,in_progress) for candidates,
+  // but ensureStrandedIssueRecoveryIssue and createIssueGraphLivenessEscalation
+  // also gate at the creation step so other entry paths (heartbeat,
+  // external rate-limit ladder, harness liveness escalation) cannot spawn
+  // a sub-issue against a terminal source.
+  it("DGG-7354: skips recovery sub-issue creation when the source issue is done", async () => {
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "failed",
+      retryReason: "issue_continuation_needed",
+      runErrorCode: "process_lost",
+      runError: "Lost in-memory process handle",
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    const subIssues = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+          eq(issues.originId, issueId),
+        ),
+      );
+    expect(subIssues).toHaveLength(0);
+  });
 });
