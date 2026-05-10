@@ -9021,6 +9021,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     reconcileStrandedAssignedIssues,
 
+    // DGG-7354: expose direct escalation entry so tests can drive a
+    // closed-source escalation path without going through the candidate
+    // status filter inside reconcileStrandedAssignedIssues.
+    escalateStrandedAssignedIssue: recovery.escalateStrandedAssignedIssue,
+
     buildIssueGraphLivenessAutoRecoveryPreview,
 
     reconcileIssueGraphLiveness,
