@@ -7687,6 +7687,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // pile-up (see reconcileStrandedAssignedIssues for the same exclusion + rationale).
         issue.originKind !== "routine_execution";
 
+      // Local fix (2026-05-11): routine_execution auto-close gap.
+      // Adapter does not PATCH issue status on wake termination; agent self-PATCH may be missed
+      // (process_lost / disconnect / etc). Recovery path is intentionally skipped above to avoid
+      // gateway-restart blocked pile-up, but the in_progress issue stays orphaned forever,
+      // accumulating noise and forcing reconcile-level fallback cleanup. Silently move the
+      // routine_execution issue to its terminal status here; recovery path remains untouched.
+      if (
+        issue.originKind === "routine_execution" &&
+        (issue.status === "todo" || issue.status === "in_progress") &&
+        !issue.assigneeUserId &&
+        issue.assigneeAgentId === run.agentId &&
+        (run.status === "failed" ||
+          run.status === "timed_out" ||
+          run.status === "cancelled" ||
+          run.status === "succeeded")
+      ) {
+        const finalStatus = run.status === "succeeded" ? "done" : "cancelled";
+        await tx
+          .update(issues)
+          .set({ status: finalStatus, updatedAt: new Date() })
+          .where(and(eq(issues.id, issue.id), eq(issues.assigneeAgentId, run.agentId)));
+        return { kind: "released" as const };
+      }
+
       if (!issueNeedsImmediateRecovery) {
         return { kind: "released" as const };
       }
