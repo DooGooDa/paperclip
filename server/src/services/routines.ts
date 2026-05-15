@@ -1338,7 +1338,15 @@ export function routineService(
       filters?: { projectId?: string | null },
     ): Promise<RoutineListItem[]> => {
       const conditions = [eq(routines.companyId, companyId)];
-      if (filters?.projectId) conditions.push(eq(routines.projectId, filters.projectId));
+      if (filters?.projectId) {
+        const pid = filters.projectId;
+        // UUID prefix lookup (issues.ts와 동일 패턴, 2026-05-15 root-cause fix 확장)
+        if (pid.length === 36) {
+          conditions.push(eq(routines.projectId, pid));
+        } else if (pid.length >= 8) {
+          conditions.push(sql`${routines.projectId}::text LIKE ${pid + '%'}`);
+        }
+      }
 
       const rows = await db
         .select()

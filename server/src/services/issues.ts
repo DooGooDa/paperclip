@@ -2204,7 +2204,18 @@ export function issueService(db: Db) {
       if (unreadForUserId) {
         conditions.push(unreadForUserCondition(companyId, unreadForUserId));
       }
-      if (filters?.projectId) conditions.push(eq(issues.projectId, filters.projectId));
+      if (filters?.projectId) {
+        const pid = filters.projectId;
+        // Full UUID (36 chars) — exact match. Short ID prefix (8-35 chars) — LIKE match on text cast.
+        // Root-cause fix 2026-05-15: 외부 caller(web UI bookmark/shared URL)가 8-char prefix로 진입 시
+        // useParams가 그대로 추출 → ?projectId=b3061b25 같이 호출되어 invalid uuid 22P02 500. prefix lookup으로 graceful resolve.
+        if (pid.length === 36) {
+          conditions.push(eq(issues.projectId, pid));
+        } else if (pid.length >= 8) {
+          conditions.push(sql`${issues.projectId}::text LIKE ${pid + '%'}`);
+        }
+        // pid.length < 8 — silently skip (too ambiguous, would return whole table)
+      }
       if (filters?.workspaceId) {
         conditions.push(or(
           eq(issues.executionWorkspaceId, filters.workspaceId),

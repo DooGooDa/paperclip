@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, desc, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
@@ -400,7 +400,15 @@ export function executionWorkspaceService(db: Db) {
     },
   ) {
     const conditions = [eq(executionWorkspaces.companyId, companyId)];
-    if (filters?.projectId) conditions.push(eq(executionWorkspaces.projectId, filters.projectId));
+    if (filters?.projectId) {
+      const pid = filters.projectId;
+      // UUID prefix lookup (issues.ts와 동일 패턴, 2026-05-15 root-cause fix 확장)
+      if (pid.length === 36) {
+        conditions.push(eq(executionWorkspaces.projectId, pid));
+      } else if (pid.length >= 8) {
+        conditions.push(sql`${executionWorkspaces.projectId}::text LIKE ${pid + '%'}`);
+      }
+    }
     if (filters?.projectWorkspaceId) {
       conditions.push(eq(executionWorkspaces.projectWorkspaceId, filters.projectWorkspaceId));
     }
