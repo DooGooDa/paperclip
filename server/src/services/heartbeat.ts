@@ -7556,18 +7556,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Self-comment guard: agent가 본인 이슈에 self-comment + done을 board adapter
         // 경유로 박으면 wake는 actor=user/local-board로 잡혀 selfComment 가드를 우회한다.
         // contextSnapshot.commentAuthorAgentId가 deferred.agentId와 일치하면
-        // "본인이 본인 이슈에 코멘트 후 done" 케이스이므로 자동 reopen 금지 (self-loop 방지).
+        // "본인이 본인 이슈에 코멘트 후 done" 케이스 — promotion 자체를 cancel.
+        // Reopen만 차단하면 새 run은 여전히 생성되어 self-loop가 지속됨.
         const deferredCommentAuthorAgentId =
           readNonEmptyString(deferredContextSeed.commentAuthorAgentId);
         const isSelfCommentDeferred =
           deferredCommentAuthorAgentId !== null &&
           deferredCommentAuthorAgentId === deferred.agentId;
+        if (
+          isSelfCommentDeferred &&
+          (issue.status === "done" || issue.status === "cancelled")
+        ) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Self-comment on closed issue (self-loop guard)",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =
           deferredCommentIds.length > 0 &&
           (issue.status === "done" || issue.status === "cancelled") &&
-          !isSelfCommentDeferred &&
           (
             deferred.requestedByActorType === "user" ||
             deferredWakeReason === "issue_reopened_via_comment"
