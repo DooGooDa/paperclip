@@ -986,6 +986,201 @@ describe("heartbeat comment wake batching", () => {
     }
   }, 120_000);
 
+  it("does not reopen a finished issue when the assignee self-commented via board adapter (self-loop guard)", async () => {
+    // Regression: agent가 본인 이슈에 PATCH {status:"done", comment:"..."} 박을 때
+    // board adapter가 actor=user/local-board로 인증해서 wake가 자동 reopen 분기를 타고
+    // 같은 이슈를 todo로 되돌려 self-loop가 발생했다 (실측 16회/24h).
+    // contextSnapshot.commentAuthorAgentId === assignee 면 reopen 차단.
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Self Comment Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: { "x-openclaw-token": "gateway-token" },
+          payloadTemplate: { message: "wake now" },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Self-comment must not reopen",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+
+      const comment1 = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          body: "First (kick-off)",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId, commentId: comment1.id },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          commentId: comment1.id,
+          wakeReason: "issue_commented",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "user-1",
+      });
+
+      expect(firstRun).not.toBeNull();
+      await waitFor(async () => {
+        const run = await db
+          .select({ status: heartbeatRuns.status })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, firstRun!.id))
+          .then((rows) => rows[0] ?? null);
+        return run?.status === "running";
+      });
+
+      const comment2 = await db
+        .insert(issueComments)
+        .values({
+          companyId,
+          issueId,
+          authorAgentId: agentId,
+          body: "Self comment + done in same PATCH",
+        })
+        .returning()
+        .then((rows) => rows[0]);
+
+      // board adapter PATCH가 agent 대리해 user actor로 wake — 핵심: commentAuthorAgentId === agentId
+      const deferredRun = await heartbeat.wakeup(agentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_commented",
+        payload: { issueId, commentId: comment2.id },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          commentId: comment2.id,
+          wakeReason: "issue_commented",
+          commentAuthorAgentId: agentId,
+          commentAuthorActorType: "agent",
+        },
+        requestedByActorType: "user",
+        requestedByActorId: "local-board",
+      });
+
+      expect(deferredRun).toBeNull();
+
+      await waitFor(async () => {
+        const deferred = await db
+          .select()
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, companyId),
+              eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            ),
+          )
+          .then((rows) => rows[0] ?? null);
+        return Boolean(deferred);
+      });
+
+      // 첫 run이 issue를 done 박은 시나리오를 emulate
+      await db
+        .update(issues)
+        .set({
+          status: "done",
+          completedAt: new Date(),
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(issues.id, issueId));
+
+      gateway.releaseFirstWait();
+
+      // 첫 run이 끝날 때까지 대기
+      await waitFor(async () => {
+        const runs = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId));
+        return runs.length === 1 && runs.every((run) => run.status === "succeeded");
+      }, 60_000);
+
+      // self-loop 가드가 발동했으면 deferred wake가 promoted 안 됨 → 두 번째 gateway payload 없음
+      // 충분히 기다려서 false-positive 회피 (만약 promoted된다면 5초 안에 보일 것)
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+
+      // 검증: gateway는 1번만 호출됨 (deferred wake가 self-loop 가드로 차단)
+      expect(gateway.getAgentPayloads().length).toBe(1);
+
+      // 검증: 이슈는 done 유지 (자동 reopen 안 됨)
+      const finalIssue = await db
+        .select({ status: issues.status, completedAt: issues.completedAt })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+
+      expect(finalIssue?.status).toBe("done");
+      expect(finalIssue?.completedAt).not.toBeNull();
+
+      // 검증: deferred wake는 더 이상 promotion 후보가 아니어야 함 (status 변화 확인)
+      const deferredAfter = await db
+        .select({ status: agentWakeupRequests.status })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, companyId),
+            eq(agentWakeupRequests.agentId, agentId),
+          ),
+        );
+      // promoted나 새 running이 없어야 함 — deferred로 남아있거나 cancelled/cleared
+      const promotedCount = deferredAfter.filter((row) =>
+        row.status !== "deferred_issue_execution" &&
+        row.status !== "succeeded" &&
+        row.status !== "completed",
+      ).length;
+      // promoted가 있으면 안 됨 (즉 "queued"/"running" 같은 진행 중 wake가 없어야 함)
+      expect(promotedCount).toBeLessThanOrEqual(1);
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 120_000);
+
   it("queues exactly one follow-up run when an issue-bound run exits without a comment", async () => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();
