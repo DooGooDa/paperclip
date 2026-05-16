@@ -2765,6 +2765,10 @@ export function issueRoutes(
               taskId: id,
               commentId: comment.id,
               wakeCommentId: comment.id,
+              // Self-comment guard 정보 — heartbeat deferred reopen 로직에서 사용.
+              // board adapter 경유 PATCH(actor=user)도 원 작성자가 agent면 본인 값 보존.
+              commentAuthorAgentId: actorIsAgent ? actor.actorId : null,
+              commentAuthorActorType: actor.actorType,
               source: reopened ? "issue.comment.reopen" : "issue.comment",
               wakeReason: reopened ? "issue_reopened_via_comment" : "issue_commented",
               ...(reopened ? { reopenedFrom: reopenFromStatus } : {}),
@@ -3769,6 +3773,9 @@ export function issueRoutes(
               taskId: currentIssue.id,
               commentId: comment.id,
               wakeCommentId: comment.id,
+              // Self-comment guard — heartbeat deferred reopen 로직에서 사용.
+              commentAuthorAgentId: actorIsAgent ? actor.actorId : null,
+              commentAuthorActorType: actor.actorType,
               source: "issue.comment.reopen",
               wakeReason: "issue_reopened_via_comment",
               reopenedFrom: reopenFromStatus,
@@ -3795,6 +3802,9 @@ export function issueRoutes(
               taskId: currentIssue.id,
               commentId: comment.id,
               wakeCommentId: comment.id,
+              // Self-comment guard — heartbeat deferred reopen 로직에서 사용.
+              commentAuthorAgentId: actorIsAgent ? actor.actorId : null,
+              commentAuthorActorType: actor.actorType,
               source: "issue.comment",
               wakeReason: "issue_commented",
               ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),
