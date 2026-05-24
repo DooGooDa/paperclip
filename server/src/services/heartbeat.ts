@@ -2076,7 +2076,7 @@ function buildProcessLossMessage(run: {
   if (run.processGroupId) {
     return `Process lost -- process group ${run.processGroupId} is no longer running`;
   }
-  return "Process lost -- server may have restarted";
+  return "Process lost -- no live process handle was found; inspect the run transcript and gateway logs before treating this as a server restart";
 }
 
 function truncateDisplayId(value: string | null | undefined, max = 128) {
@@ -2181,6 +2181,10 @@ export interface HeartbeatServiceOptions {
   environmentRuntime?: HeartbeatEnvironmentRuntime;
 }
 
+// Module-scope so every heartbeatService() instance shares one in-flight registry.
+// See note on `activeRunExecutions = sharedActiveRunExecutions` for context.
+const sharedActiveRunExecutions = new Set<string>();
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   const instanceSettings = instanceSettingsService(db);
   const getCurrentUserRedactionOptions = async () => ({
@@ -2202,7 +2206,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     environmentRuntime,
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
-  const activeRunExecutions = new Set<string>();
+  // Shared at module scope: multiple heartbeatService() instances (index.ts scheduler
+  // + routes/issues.ts + routes/approvals.ts + others) all need to see the same set
+  // of in-flight run ids. Without module-scope sharing, the index.ts reaper looks at
+  // its own (empty) Set while runs spawned from HTTP routes/wakeup paths live in a
+  // different instance's Set, causing live runs to be misclassified as orphaned and
+  // killed at ~5-10 min (the staleness window). Root-cause sibling to commit b4ac2c10
+  // which only fixed the routine-service path.
+  const activeRunExecutions = sharedActiveRunExecutions;
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
