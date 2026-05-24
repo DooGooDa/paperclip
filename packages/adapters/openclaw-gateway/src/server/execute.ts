@@ -1082,6 +1082,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const timeoutMs = timeoutSec > 0 ? timeoutSec * 1000 : 0;
   const connectTimeoutMs = timeoutMs > 0 ? Math.min(timeoutMs, 15_000) : 10_000;
   const waitTimeoutMs = parseOptionalPositiveInteger(ctx.config.waitTimeoutMs) ?? (timeoutMs > 0 ? timeoutMs : 30_000);
+  const agentTimeoutSec = Math.max(1, Math.ceil(waitTimeoutMs / 1000));
 
   const payloadTemplate = parseObject(ctx.config.payloadTemplate);
   const transportHint = nonEmpty(ctx.config.streamTransport) ?? nonEmpty(ctx.config.transport);
@@ -1152,7 +1153,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   if (typeof agentParams.timeout !== "number") {
-    agentParams.timeout = waitTimeoutMs;
+    agentParams.timeout = agentTimeoutSec;
   }
 
   if (ctx.onMeta) {
