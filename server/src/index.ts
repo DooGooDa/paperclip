@@ -718,7 +718,13 @@ export async function startServer(): Promise<StartedServer> {
   
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
-    const routines = routineService(db as any, { pluginWorkerManager });
+    // Share the heartbeat instance with routines so routine-initiated runs are visible to
+    // the same in-memory execution registry used by the orphan reaper. Without this, routine
+    // dispatch builds a second heartbeat instance whose live runs are invisible to the
+    // reaper at scheduler tick boundaries, and active routine runs get incorrectly marked
+    // as orphaned (observed as openclaw_gateway_wait_timeout failures after "reaped orphaned
+    // heartbeat runs" log lines).
+    const routines = routineService(db as any, { pluginWorkerManager, heartbeat });
   
     // Reap orphaned running runs at startup while in-memory execution state is empty,
     // then resume any persisted queued runs that were waiting on the previous process.
