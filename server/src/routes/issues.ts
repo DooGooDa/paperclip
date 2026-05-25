@@ -2062,6 +2062,54 @@ export function issueRoutes(
     assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
 
+    // Executor self-done flip guard (Kuromi COO directive 2026-05-26 cycle 14 fix).
+    // Reject status=done PATCH when:
+    //   (a) actor.type === 'agent' (board/local admin path unaffected), AND
+    //   (b) actorAgent.role !== 'ceo' (COO/CEO whitelist for Final 3-Gate), AND
+    //   (c) existing.assigneeAgentId === actor.agentId (only blocks self-done; reviewer flips OK), AND
+    //   (d) existing.originKind is in MANUAL_DONE_GUARD_KINDS (excludes auto-recovery/routine wakes), AND
+    //   (e) requested status === 'done'.
+    // Rationale: 14-cycle evidence forgery + cross-RR done flip pattern (DGG-11567..11919 24h).
+    // Whitelisted origin kinds for auto-flip: routine_execution, stranded_issue_recovery,
+    // issue_productivity_review, harness_liveness_escalation, blocker_attention_open_recovery.
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      typeof req.body.status === "string" &&
+      req.body.status === "done" &&
+      existing.assigneeAgentId === req.actor.agentId &&
+      existing.originKind === "manual"
+    ) {
+      const actorAgentForGate = await agentsSvc.getById(req.actor.agentId);
+      const isReviewerRole = actorAgentForGate?.role === "ceo";
+      if (!isReviewerRole) {
+        res.status(403).json({
+          error: "Executor cannot self-flip manual issue to done",
+          details: {
+            issueId: existing.id,
+            actorAgentId: req.actor.agentId,
+            assigneeAgentId: existing.assigneeAgentId,
+            originKind: existing.originKind,
+            actorRole: actorAgentForGate?.role ?? null,
+            policy: {
+              rule: "executor-self-done-flip-ban",
+              gateOwner: "ceo-role (COO Final 3-Gate)",
+              whitelistedOriginKinds: [
+                "routine_execution",
+                "stranded_issue_recovery",
+                "issue_productivity_review",
+                "harness_liveness_escalation",
+                "blocker_attention_open_recovery",
+              ],
+              allowedTerminalStatus: ["in_review"],
+              source: "AGENTS.md L341 (이슈 거버넌스: 실행자 done 금지)",
+            },
+          },
+        });
+        return;
+      }
+    }
+
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
