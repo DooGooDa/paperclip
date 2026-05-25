@@ -1332,6 +1332,113 @@ describe("heartbeat comment wake batching", () => {
     }
   }, 20_000);
 
+  it("does not queue a follow-up run for routine_execution issues even without a comment", async () => {
+    // buildWakeText ban + routine_execution 별도 라이프사이클 → commentRequired 면제.
+    // L1184 manual 시나리오와 동일하지만 originKind='routine_execution'일 때
+    // retry 없이 not_applicable 종결.
+    const gateway = await createControlledGatewayServer();
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    const heartbeat = heartbeatService(db);
+
+    try {
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        requireBoardApprovalForNewAgents: false,
+      });
+
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Gateway Agent",
+        role: "engineer",
+        status: "idle",
+        adapterType: "openclaw_gateway",
+        adapterConfig: {
+          url: gateway.url,
+          headers: {
+            "x-openclaw-token": "gateway-token",
+          },
+          payloadTemplate: {
+            message: "wake now",
+          },
+          waitTimeoutMs: 2_000,
+        },
+        runtimeConfig: {},
+        permissions: {},
+      });
+
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Routine wake — no comment required",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        originKind: "routine_execution",
+      });
+
+      const firstRun = await heartbeat.wakeup(agentId, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+        },
+        requestedByActorType: "system",
+        requestedByActorId: null,
+      });
+
+      expect(firstRun).not.toBeNull();
+      await waitFor(() => gateway.getAgentPayloads().length === 1);
+      gateway.releaseFirstWait();
+      await waitFor(async () => {
+        const runs = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.agentId, agentId))
+          .orderBy(asc(heartbeatRuns.createdAt));
+        return runs.length === 1 && runs[0]?.status === "succeeded";
+      });
+
+      // routine_execution은 retry 없이 단발 종결: not_applicable
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId))
+        .orderBy(asc(heartbeatRuns.createdAt));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.issueCommentStatus).toBe("not_applicable");
+      expect(runs[0]?.issueCommentSatisfiedByCommentId).toBeNull();
+      expect(runs[0]?.issueCommentRetryQueuedAt).toBeNull();
+
+      // 코멘트도 없고 retry wake도 큐잉 안 됨
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(0);
+
+      const wakeups = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId)));
+      expect(wakeups).toHaveLength(1);
+
+      const payloads = gateway.getAgentPayloads();
+      expect(payloads).toHaveLength(1);
+    } finally {
+      gateway.releaseFirstWait();
+      await gateway.close();
+    }
+  }, 20_000);
+
   it("defers mentioned-agent wakes while another agent is actively executing the same issue", async () => {
     const gateway = await createControlledGatewayServer();
     const companyId = randomUUID();

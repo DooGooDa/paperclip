@@ -4153,6 +4153,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return { outcome: "not_applicable" as const, queuedRun: null };
     }
 
+    // routine_execution은 매 cron tick마다 새로 태어나는 별도 라이프사이클
+    // (issueNeedsImmediateRecovery / auto-close gap 분기 참조) + buildWakeText
+    // (packages/adapters/openclaw-gateway/src/server/execute.ts)에 "NEVER POST
+    // to /api/issues/{id}/comments" ban이 박혀 있어 commentRequired retry는
+    // 시스템 모순을 만든다. 면제 처리.
+    const issueOriginRow = await db
+      .select({ originKind: issues.originKind })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (issueOriginRow?.originKind === "routine_execution") {
+      if (run.issueCommentStatus !== "not_applicable") {
+        await patchRunIssueCommentStatus(run.id, {
+          issueCommentStatus: "not_applicable",
+          issueCommentSatisfiedByCommentId: null,
+          issueCommentRetryQueuedAt: null,
+        });
+      }
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
+
     const postedComment = await findRunIssueComment(run.id, run.companyId, issueId);
     if (postedComment) {
       await patchRunIssueCommentStatus(run.id, {
