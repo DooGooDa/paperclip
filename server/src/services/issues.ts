@@ -80,6 +80,8 @@ import {
 import { classifyIssueGraphLiveness, type IssueLivenessFinding } from "./recovery/issue-graph-liveness.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const OPEN_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
+const ISSUE_CREATE_DUPLICATE_GUARD_WINDOW_MS = 5 * 60 * 1000;
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
@@ -114,6 +116,10 @@ function applyStatusSideEffects(
     patch.cancelledAt = new Date();
   }
   return patch;
+}
+
+function normalizeIssueTitleForDuplicateGuard(title: string) {
+  return title.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 function readStringFromRecord(record: unknown, key: string) {
@@ -296,6 +302,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
+  clientRequestId?: string | null;
 };
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
@@ -4066,6 +4073,7 @@ export function issueService(db: Db) {
         labelIds: inputLabelIds,
         blockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
+        clientRequestId,
         ...issueData
       } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
@@ -4087,6 +4095,34 @@ export function issueService(db: Db) {
         throw unprocessable("in_progress issues require an assignee");
       }
       return db.transaction(async (tx) => {
+        const normalizedTitle = normalizeIssueTitleForDuplicateGuard(issueData.title);
+        const duplicateGuardWindowStart = new Date(Date.now() - ISSUE_CREATE_DUPLICATE_GUARD_WINDOW_MS);
+        const existingRecentOpenIssue = await tx
+          .select({
+            id: issues.id,
+            identifier: issues.identifier,
+            title: issues.title,
+            createdAt: issues.createdAt,
+          })
+          .from(issues)
+          .where(and(
+            eq(issues.companyId, companyId),
+            inArray(issues.status, [...OPEN_ISSUE_STATUSES]),
+            gt(issues.createdAt, duplicateGuardWindowStart),
+          ))
+          .orderBy(desc(issues.createdAt), desc(issues.id))
+          .then((rows) =>
+            rows.find((row) => normalizeIssueTitleForDuplicateGuard(row.title) === normalizedTitle) ?? null,
+          );
+        if (existingRecentOpenIssue) {
+          throw conflict("Issue create duplicate guard triggered", {
+            existingIssueId: existingRecentOpenIssue.id,
+            existingIssueIdentifier: existingRecentOpenIssue.identifier,
+            duplicateWindowMinutes: ISSUE_CREATE_DUPLICATE_GUARD_WINDOW_MS / 60_000,
+            clientRequestId: clientRequestId ?? null,
+          });
+        }
+
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;

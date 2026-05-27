@@ -394,9 +394,12 @@ const createIssueBaseSchema = z.object({
 
 export const createIssueInputSchema = createIssueBaseSchema.extend({
   status: createIssueBaseSchema.shape.status.optional(),
+  clientRequestId: z.string().trim().min(1).max(255).optional().nullable(),
 });
 
-export const createIssueSchema = withCreateIssueStatusDefault(createIssueBaseSchema);
+export const createIssueSchema = withCreateIssueStatusDefault(createIssueBaseSchema.extend({
+  clientRequestId: z.string().trim().min(1).max(255).optional().nullable(),
+}));
 
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 

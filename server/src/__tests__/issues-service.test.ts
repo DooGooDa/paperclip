@@ -1520,6 +1520,73 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await tempDb?.cleanup();
   });
 
+  it("blocks duplicate creates within five minutes for open issues and echoes clientRequestId", async () => {
+    const companyId = randomUUID();
+    const baseTitle = "AC-4b issue-create 5min duplicate guard";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const existing = await svc.create(companyId, {
+      title: baseTitle,
+      status: "todo",
+      priority: "medium",
+    });
+
+    await expect(
+      svc.create(companyId, {
+        title: "  ac-4b   ISSUE-create   5min   duplicate guard  ",
+        status: "backlog",
+        priority: "medium",
+        clientRequestId: "dispatch-cycle-15",
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: "Issue create duplicate guard triggered",
+      details: expect.objectContaining({
+        existingIssueId: existing.id,
+        existingIssueIdentifier: existing.identifier,
+        duplicateWindowMinutes: 5,
+        clientRequestId: "dispatch-cycle-15",
+      }),
+    });
+  });
+
+  it("allows same title when prior issue is outside the five-minute duplicate window", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const existing = await svc.create(companyId, {
+      title: "AC-4b issue-create 5min duplicate guard",
+      status: "todo",
+      priority: "medium",
+    });
+
+    await db
+      .update(issues)
+      .set({ createdAt: new Date(Date.now() - 6 * 60 * 1000) })
+      .where(eq(issues.id, existing.id));
+
+    const created = await svc.create(companyId, {
+      title: "ac-4b issue-create 5min duplicate guard",
+      status: "todo",
+      priority: "medium",
+      clientRequestId: "dispatch-cycle-16",
+    });
+
+    expect(created.id).not.toBe(existing.id);
+  });
+
   it("inherits the parent issue workspace linkage when child workspace fields are omitted", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
