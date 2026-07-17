@@ -41,11 +41,13 @@ function buildContext(
 
 async function createMockGatewayServer(options?: {
   waitPayload?: Record<string, unknown>;
+  sessionsListPayload?: Record<string, unknown>;
 }) {
   const server = createServer();
   const wss = new WebSocketServer({ server });
 
   let agentPayload: Record<string, unknown> | null = null;
+  let sessionSendPayload: Record<string, unknown> | null = null;
 
   wss.on("connection", (socket) => {
     socket.send(
@@ -81,6 +83,31 @@ async function createMockGatewayServer(options?: {
               snapshot: { version: 1, ts: Date.now() },
               policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 },
             },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "sessions.list") {
+        socket.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: options?.sessionsListPayload ?? { sessions: [] },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "sessions.send") {
+        sessionSendPayload = frame.params ?? null;
+        socket.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: { runId: "notify-run-123", status: "ok" },
           }),
         );
         return;
@@ -165,6 +192,7 @@ async function createMockGatewayServer(options?: {
   return {
     url: `ws://127.0.0.1:${address.port}`,
     getAgentPayload: () => agentPayload,
+    getSessionSendPayload: () => sessionSendPayload,
     close: async () => {
       await new Promise<void>((resolve) => wss.close(() => resolve()));
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -239,12 +267,24 @@ async function createMockGatewayServerWithPairing() {
               protocol: 3,
               server: { version: "test", connId: "conn-1" },
               features: {
-                methods: ["connect", "agent", "agent.wait", "device.pair.list", "device.pair.approve"],
+                methods: ["connect", "agent", "agent.wait", "sessions.list", "device.pair.list", "device.pair.approve"],
                 events: ["agent"],
               },
               snapshot: { version: 1, ts: Date.now() },
               policy: { maxPayload: 1_000_000, maxBufferedBytes: 1_000_000, tickIntervalMs: 30_000 },
             },
+          }),
+        );
+        return;
+      }
+
+      if (frame.method === "sessions.list") {
+        socket.send(
+          JSON.stringify({
+            type: "res",
+            id: frame.id,
+            ok: true,
+            payload: { sessions: [] },
           }),
         );
         return;
@@ -502,14 +542,69 @@ describe("openclaw gateway adapter execute", () => {
       );
       expect(String(payload?.message ?? "")).toContain("First comment");
       expect(String(payload?.message ?? "")).toContain("\"commentIds\":[\"comment-1\",\"comment-2\"]");
-      expect(payload?.paperclip).toMatchObject({
-        wake: {
-          latestCommentId: "comment-2",
-          commentIds: ["comment-1", "comment-2"],
-        },
-      });
+      expect(String(payload?.extraSystemPrompt ?? "")).toContain("PAPERCLIP_PAYLOAD_V1");
+      expect(String(payload?.extraSystemPrompt ?? "")).toContain('"latestCommentId":"comment-2"');
+      expect(String(payload?.extraSystemPrompt ?? "")).toContain('"commentIds":["comment-1","comment-2"]');
 
       expect(logs.some((entry) => entry.includes("[openclaw-gateway:event] run=run-123 stream=assistant"))).toBe(true);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("suppresses duplicate issue wakes when the target issue session already has an active run", async () => {
+    const gateway = await createMockGatewayServer({
+      sessionsListPayload: {
+        sessions: [
+          {
+            key: "paperclip:issue:issue-123",
+            status: "running",
+            hasActiveRun: true,
+            activeRunId: "existing-run-456",
+          },
+        ],
+      },
+    });
+    const logs: string[] = [];
+
+    try {
+      const result = await execute(
+        buildContext(
+          {
+            url: gateway.url,
+            headers: {
+              "x-openclaw-token": "gateway-token",
+            },
+            payloadTemplate: {
+              message: "wake now",
+            },
+            waitTimeoutMs: 2000,
+          },
+          {
+            onLog: async (_stream, chunk) => {
+              logs.push(chunk);
+            },
+          },
+        ),
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.summary).toContain("suppressed duplicate Paperclip wake");
+      expect(result.resultJson).toMatchObject({
+        status: "skipped",
+        reason: "same_issue_active_session",
+        sessionKey: "paperclip:issue:issue-123",
+        issueId: "issue-123",
+        notificationStatus: "sent",
+      });
+      expect(gateway.getAgentPayload()).toBeNull();
+      expect(gateway.getSessionSendPayload()).toMatchObject({
+        key: "paperclip:issue:issue-123",
+        idempotencyKey: "run-123:active-session-gate-notify",
+      });
+      expect(String(gateway.getSessionSendPayload()?.message ?? "")).toContain("duplicate wake suppressed");
+      expect(logs.some((entry) => entry.includes("active session gate suppressed duplicate issue wake"))).toBe(true);
+      expect(logs.some((entry) => entry.includes("active session gate notification sent"))).toBe(true);
     } finally {
       await gateway.close();
     }
