@@ -1045,6 +1045,80 @@ function extractResultText(value: unknown): string | null {
   return nonEmpty(record.text) ?? nonEmpty(record.summary) ?? null;
 }
 
+function extractSessionKey(value: unknown): string | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  return nonEmpty(record.key) ?? nonEmpty(record.sessionKey);
+}
+
+function extractRunIdSet(value: unknown): Set<string> {
+  const record = asRecord(value);
+  const out = new Set<string>();
+  if (!record) return out;
+
+  for (const key of ["runId", "activeRunId", "currentRunId", "clientRunId", "latestRunId"]) {
+    const runId = nonEmpty(record[key]);
+    if (runId) out.add(runId);
+  }
+
+  const activeRun = asRecord(record.activeRun);
+  const activeRunId = nonEmpty(activeRun?.runId) ?? nonEmpty(activeRun?.id);
+  if (activeRunId) out.add(activeRunId);
+
+  return out;
+}
+
+function isActiveSessionRow(value: unknown, currentRunId: string): boolean {
+  const record = asRecord(value);
+  if (!record) return false;
+
+  const runIds = extractRunIdSet(record);
+  if (runIds.has(currentRunId)) return false;
+
+  if (record.hasActiveRun === true) return true;
+
+  const status = nonEmpty(record.status)?.toLowerCase();
+  if (status === "running" || status === "in_progress" || status === "active") return true;
+
+  const activeRun = asRecord(record.activeRun);
+  if (activeRun) {
+    const activeStatus = nonEmpty(activeRun.status)?.toLowerCase();
+    if (activeStatus === "running" || activeStatus === "in_progress" || activeStatus === "active") return true;
+    if (activeRun.endedAt == null && (nonEmpty(activeRun.runId) || nonEmpty(activeRun.id))) return true;
+  }
+
+  return false;
+}
+
+function findActiveSessionForKey(value: unknown, sessionKey: string, currentRunId: string): Record<string, unknown> | null {
+  const record = asRecord(value);
+  const sessions = Array.isArray(record?.sessions) ? record.sessions : [];
+  for (const entry of sessions) {
+    const session = asRecord(entry);
+    if (!session) continue;
+    if (extractSessionKey(session) !== sessionKey) continue;
+    if (isActiveSessionRow(session, currentRunId)) return session;
+  }
+  return null;
+}
+
+function buildActiveSessionGateNotification(params: {
+  wakePayload: WakePayload;
+  runId: string;
+  sessionKey: string;
+}): string {
+  const identifier = params.wakePayload.issueId ?? params.wakePayload.taskId ?? "unknown issue";
+  const reason = params.wakePayload.wakeReason ?? "paperclip wake";
+  return [
+    "Paperclip duplicate wake suppressed.",
+    `Issue: ${identifier}`,
+    `Reason: ${reason}`,
+    `Suppressed run: ${params.runId}`,
+    `Session: ${params.sessionKey}`,
+    "Continue the already-active issue run; do not start a second session for the same issue.",
+  ].join("\n");
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const urlValue = asString(ctx.config.url, "").trim();
   if (!urlValue) {
@@ -1326,6 +1400,91 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "stdout",
         `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)}\n`,
       );
+
+      const sameIssueActiveSessionGate = parseBoolean(
+        ctx.config.sameIssueActiveSessionGate ?? ctx.config.activeSessionGate,
+        true,
+      );
+      const sameIssueActiveSessionNotify = parseBoolean(
+        ctx.config.sameIssueActiveSessionNotify ?? ctx.config.activeSessionNotify,
+        true,
+      );
+
+      const helloFeatures = asRecord(asRecord(hello)?.features);
+      const helloMethods = Array.isArray(helloFeatures?.methods) ? helloFeatures.methods : [];
+      const supportsSessionsList = helloMethods.includes("sessions.list");
+
+      if (sameIssueActiveSessionGate && sessionKeyStrategy === "issue" && wakePayload.issueId && supportsSessionsList) {
+        const sessionsPayload = await client.request<Record<string, unknown>>(
+          "sessions.list",
+          {
+            configuredAgentsOnly: false,
+            includeUnknown: true,
+            includeGlobal: true,
+            limit: 200,
+            ...(configuredAgentId ? { agentId: configuredAgentId } : {}),
+          },
+          { timeoutMs: connectTimeoutMs },
+        );
+        const activeSession = findActiveSessionForKey(sessionsPayload, sessionKey, ctx.runId);
+        if (activeSession) {
+          const activeRunIds = Array.from(extractRunIdSet(activeSession));
+          await ctx.onLog(
+            "stdout",
+            `[openclaw-gateway] active session gate suppressed duplicate issue wake issueId=${wakePayload.issueId} assigneeAgentId=${configuredAgentId ?? "unknown"} hostUrl=${urlValue} sessionKey=${sessionKey} activeRunIds=${activeRunIds.join(",") || "unknown"}\n`,
+          );
+
+          let notificationStatus: "sent" | "failed" | "disabled" = "disabled";
+          if (sameIssueActiveSessionNotify) {
+            const notificationMessage =
+              nonEmpty(ctx.config.sameIssueActiveSessionNotifyMessage) ??
+              buildActiveSessionGateNotification({
+                wakePayload,
+                runId: ctx.runId,
+                sessionKey,
+              });
+            try {
+              await client.request<Record<string, unknown>>(
+                "sessions.send",
+                {
+                  key: sessionKey,
+                  message: notificationMessage,
+                  timeoutMs: connectTimeoutMs,
+                  idempotencyKey: `${ctx.runId}:active-session-gate-notify`,
+                },
+                { timeoutMs: connectTimeoutMs },
+              );
+              notificationStatus = "sent";
+              await ctx.onLog(
+                "stdout",
+                `[openclaw-gateway] active session gate notification sent sessionKey=${sessionKey}\n`,
+              );
+            } catch (notifyErr) {
+              notificationStatus = "failed";
+              await ctx.onLog(
+                "stderr",
+                `[openclaw-gateway] active session gate notification failed: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}\n`,
+              );
+            }
+          }
+
+          return {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            provider: "openclaw",
+            summary: `suppressed duplicate Paperclip wake for active session ${sessionKey}`,
+            resultJson: {
+              status: "skipped",
+              reason: "same_issue_active_session",
+              sessionKey,
+              issueId: wakePayload.issueId,
+              activeRunIds,
+              notificationStatus,
+            },
+          };
+        }
+      }
 
       const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
         timeoutMs: connectTimeoutMs,
