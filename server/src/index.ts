@@ -804,7 +804,14 @@ export async function startServer(): Promise<StartedServer> {
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, { pluginWorkerManager });
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
-    const routines = routineService(db as any, { pluginWorkerManager });
+    // DGG fork (#17 b4ac2c10): share the heartbeat instance with routines so
+    // routine-initiated runs are visible to the same in-memory execution
+    // registry used by the orphan reaper. Without this, routine dispatch builds
+    // a second heartbeat instance whose live runs are invisible to the reaper at
+    // scheduler tick boundaries, and active routine runs get incorrectly marked
+    // as orphaned (observed as openclaw_gateway_wait_timeout failures after
+    // "reaped orphaned heartbeat runs" log lines).
+    const routines = routineService(db as any, { pluginWorkerManager, heartbeat });
     const heartbeatSchedulingSuppression = resolveHeartbeatSchedulingSuppression();
 
     // Reap orphaned runs before timer ticks start so wakeups cannot coalesce

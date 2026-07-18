@@ -310,6 +310,8 @@ const GIT_SENSITIVE_LOCAL_ADAPTER_TYPES = new Set([
   "opencode_local",
   "pi_local",
 ]);
+export const OPENCLAW_GATEWAY_DISPATCH_RETRY_DELAYS_MS = [5_000, 15_000, 45_000] as const;
+const OPENCLAW_GATEWAY_DISPATCH_RETRY_ERROR_CODE = "openclaw_gateway_request_failed";
 export const MAX_TURN_CONTINUATION_RETRY_REASON = "max_turns_continuation";
 export const MAX_TURN_CONTINUATION_WAKE_REASON = "max_turns_continuation_retry";
 const MAX_TURN_CONTINUATION_DEFAULT_MAX_ATTEMPTS = 2;
@@ -372,6 +374,32 @@ function readHeartbeatRunErrorFamily(
     return "transient_upstream";
   }
   return null;
+}
+
+export function parseOpenClawGatewayDispatchRetryDelaysMs(value: unknown): number[] {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return [...OPENCLAW_GATEWAY_DISPATCH_RETRY_DELAYS_MS];
+  }
+  const parsed = value
+    .split(",")
+    .map((part) => Number(part.trim()))
+    .filter((delayMs) => Number.isFinite(delayMs) && delayMs >= 0)
+    .map((delayMs) => Math.floor(delayMs));
+  return parsed.length > 0 ? parsed : [...OPENCLAW_GATEWAY_DISPATCH_RETRY_DELAYS_MS];
+}
+
+export function isOpenClawGatewayDispatchRetryableResult(
+  agent: Pick<typeof agents.$inferSelect, "adapterType">,
+  result: Pick<AdapterExecutionResult, "exitCode" | "timedOut" | "errorCode" | "errorMessage">,
+) {
+  if (agent.adapterType !== "openclaw_gateway") return false;
+  if ((result.exitCode ?? 0) === 0 && !result.timedOut && !result.errorMessage) return false;
+  return result.errorCode === OPENCLAW_GATEWAY_DISPATCH_RETRY_ERROR_CODE;
+}
+
+function sleepMs(delayMs: number) {
+  if (delayMs <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
 function isMaxTurnExhaustionRun(
@@ -4678,7 +4706,7 @@ function buildProcessLossMessage(run: {
   if (run.processGroupId) {
     return `Process lost -- process group ${run.processGroupId} is no longer running`;
   }
-  return "Process lost -- server may have restarted";
+  return "Process lost -- no live process handle was found; inspect the run transcript and gateway logs before treating this as a server restart";
 }
 
 function truncateDisplayId(value: string | null | undefined, max = 128) {
@@ -7548,6 +7576,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
     if (!issueId) {
+      if (run.issueCommentStatus !== "not_applicable") {
+        await patchRunIssueCommentStatus(run.id, {
+          issueCommentStatus: "not_applicable",
+          issueCommentSatisfiedByCommentId: null,
+          issueCommentRetryQueuedAt: null,
+        });
+      }
+      return { outcome: "not_applicable" as const, queuedRun: null };
+    }
+
+    // routine_execution은 매 cron tick마다 새로 태어나는 별도 라이프사이클
+    // (issueNeedsImmediateRecovery / auto-close gap 분기 참조) + buildWakeText
+    // (packages/adapters/openclaw-gateway/src/server/execute.ts)에 "NEVER POST
+    // to /api/issues/{id}/comments" ban이 박혀 있어 commentRequired retry는
+    // 시스템 모순을 만든다. 면제 처리.
+    const issueOriginRow = await db
+      .select({ originKind: issues.originKind })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (issueOriginRow?.originKind === "routine_execution") {
       if (run.issueCommentStatus !== "not_applicable") {
         await patchRunIssueCommentStatus(run.id, {
           issueCommentStatus: "not_applicable",
@@ -11698,7 +11748,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
-        adapterResult = await adapter.execute({
+        const executeAdapter = () => adapter.execute({
           runId: run.id,
           agent,
           runtime: runtimeForAdapter,
@@ -11726,6 +11776,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           authToken: authToken ?? undefined,
         });
+        // DGG fork (#31 7971f0db): OpenClaw gateway dispatch can transiently fail
+        // ("openclaw_gateway_request_failed") when the gateway is mid-restart. Retry
+        // the dispatch on a bounded ladder before surfacing the run as failed.
+        const dispatchRetryDelaysMs = parseOpenClawGatewayDispatchRetryDelaysMs(
+          process.env.PAPERCLIP_OPENCLAW_GATEWAY_DISPATCH_RETRY_DELAYS_MS,
+        );
+        adapterResult = await executeAdapter();
+        if (isOpenClawGatewayDispatchRetryableResult(agent, adapterResult)) {
+          for (let retryIndex = 0; retryIndex < dispatchRetryDelaysMs.length; retryIndex += 1) {
+            const delayMs = dispatchRetryDelaysMs[retryIndex] ?? 0;
+            await appendRunEvent(currentRun, seq++, {
+              eventType: "adapter.retry",
+              stream: "system",
+              level: "warn",
+              message: `OpenClaw gateway request failed; retrying dispatch ${retryIndex + 1}/${dispatchRetryDelaysMs.length} after ${delayMs}ms`,
+              payload: {
+                adapterType: agent.adapterType,
+                errorCode: adapterResult.errorCode ?? null,
+                delayMs,
+                retryAttempt: retryIndex + 1,
+                maxRetryAttempts: dispatchRetryDelaysMs.length,
+              },
+            });
+            await sleepMs(delayMs);
+            adapterResult = await executeAdapter();
+            if (!isOpenClawGatewayDispatchRetryableResult(agent, adapterResult)) break;
+          }
+        }
         // Adapter returned cleanly, which means its workspace-restore finally
         // block also ran without throwing. Record the workspace_finalize
         // barrier so dependents that share this executionWorkspace can wake.
@@ -12646,6 +12724,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             deferredComments.length > 0 &&
             deferredComments.every((comment) => comment.createdByRunId === run.id);
         }
+
+        // Self-comment guard: agent가 본인 이슈에 self-comment + done을 board adapter
+        // 경유로 박으면 wake는 actor=user/local-board로 잡혀 selfComment 가드를 우회한다.
+        // contextSnapshot.commentAuthorAgentId가 deferred.agentId와 일치하면
+        // "본인이 본인 이슈에 코멘트 후 done" 케이스 — promotion 자체를 cancel.
+        // Reopen만 차단하면 새 run은 여전히 생성되어 self-loop가 지속됨.
+        const deferredCommentAuthorAgentId =
+          readNonEmptyString(deferredContextSeed.commentAuthorAgentId);
+        const isSelfCommentDeferred =
+          deferredCommentAuthorAgentId !== null &&
+          deferredCommentAuthorAgentId === deferred.agentId;
+        if (
+          isSelfCommentDeferred &&
+          (issue.status === "done" || issue.status === "cancelled")
+        ) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: new Date(),
+              error: "Self-comment on closed issue (self-loop guard)",
+              updatedAt: new Date(),
+            })
+            .where(eq(agentWakeupRequests.id, deferred.id));
+          continue;
+        }
         // Only human/comment-reopen interactions should revive completed issues;
         // system follow-ups such as retry or cleanup wakes must not reopen closed work.
         const shouldReopenDeferredCommentWake =
@@ -12940,7 +13044,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (issue.status === "todo" || issue.status === "in_progress") &&
         !issue.assigneeUserId &&
         issue.assigneeAgentId === run.agentId &&
-        (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
+        (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled") &&
+        // routine_execution issues are reborn every cron tick by routineRunIssueCreator.
+        // Treating them as stranded turns each gateway restart into a permanent blocked-issue
+        // pile-up (see reconcileStrandedAssignedIssues for the same exclusion + rationale).
+        issue.originKind !== "routine_execution";
+
+      // Local fix (2026-05-11): routine_execution auto-close gap.
+      // Adapter does not PATCH issue status on wake termination; agent self-PATCH may be missed
+      // (process_lost / disconnect / etc). Recovery path is intentionally skipped above to avoid
+      // gateway-restart blocked pile-up, but the in_progress issue stays orphaned forever,
+      // accumulating noise and forcing reconcile-level fallback cleanup. Silently move the
+      // routine_execution issue to its terminal status here; recovery path remains untouched.
+      if (
+        issue.originKind === "routine_execution" &&
+        (issue.status === "todo" || issue.status === "in_progress") &&
+        !issue.assigneeUserId &&
+        issue.assigneeAgentId === run.agentId &&
+        (run.status === "failed" ||
+          run.status === "timed_out" ||
+          run.status === "cancelled" ||
+          run.status === "succeeded")
+      ) {
+        const finalStatus = run.status === "succeeded" ? "done" : "cancelled";
+        await tx
+          .update(issues)
+          .set({ status: finalStatus, updatedAt: new Date() })
+          .where(and(eq(issues.id, issue.id), eq(issues.assigneeAgentId, run.agentId)));
+        return { kind: "released" as const };
+      }
 
       if (!issueNeedsImmediateRecovery) {
         return { kind: "released" as const };
@@ -12994,6 +13126,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE
               : undefined,
         };
+      }
+
+      // DGG-5392: same-source dedup must apply to the heartbeat retry path
+      // too. DGG-5210 only wired `isSameSourceRetryDuplicate` into the
+      // reconcile cron in recovery/service.ts. The terminal-run release path
+      // here also requeues automatic recovery (source =
+      // `issue.{assignment,continuation}_recovery`), so without this gate two
+      // process_lost terminations 48m apart slip through the 1h dedup window
+      // and bypass the cap+dedup contract. Use the same fingerprint helper
+      // exported from recovery service so cap/dedup remain a single SSOT.
+      if (await recovery.isSameSourceRetryDuplicate(issue.companyId, issue.id, run, new Date())) {
+        return { kind: "released" as const };
       }
 
       const retryReason = issue.status === "todo" ? "assignment_recovery" : "issue_continuation_needed";
@@ -14667,6 +14811,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileStrandedAssignedIssues,
 
     sweepStaleIssueLocks,
+
+    // DGG-7354: expose direct escalation entry so tests can drive a
+    // closed-source escalation path without going through the candidate
+    // status filter inside reconcileStrandedAssignedIssues.
+    escalateStrandedAssignedIssue: recovery.escalateStrandedAssignedIssue,
 
     buildIssueGraphLivenessAutoRecoveryPreview,
 

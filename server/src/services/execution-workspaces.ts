@@ -455,7 +455,15 @@ export function executionWorkspaceService(db: Db) {
     },
   ) {
     const conditions = [eq(executionWorkspaces.companyId, companyId)];
-    if (filters?.projectId) conditions.push(eq(executionWorkspaces.projectId, filters.projectId));
+    if (filters?.projectId) {
+      const pid = filters.projectId;
+      // UUID prefix lookup (issues.ts와 동일 패턴, 2026-05-15 root-cause fix 확장)
+      if (pid.length === 36) {
+        conditions.push(eq(executionWorkspaces.projectId, pid));
+      } else if (pid.length >= 8) {
+        conditions.push(sql`${executionWorkspaces.projectId}::text LIKE ${pid + '%'}`);
+      }
+    }
     if (filters?.projectWorkspaceId) {
       conditions.push(eq(executionWorkspaces.projectWorkspaceId, filters.projectWorkspaceId));
     }

@@ -399,7 +399,17 @@ export function routineRoutes(
       action: "routine.updated",
       entityType: "routine",
       entityId: routine.id,
-      details: { title: updated?.title ?? routine.title },
+      details: {
+        title: updated?.title ?? routine.title,
+        // Status/assignee transition을 audit log에 명시 — 누가 언제 PM routine을
+        // paused→active 박았는지 추적 가능. (governance audit + reconcile module 입력)
+        ...(req.body.status !== undefined && req.body.status !== routine.status
+          ? { statusFrom: routine.status, statusTo: req.body.status }
+          : {}),
+        ...(req.body.assigneeAgentId !== undefined && req.body.assigneeAgentId !== routine.assigneeAgentId
+          ? { assigneeFrom: routine.assigneeAgentId, assigneeTo: req.body.assigneeAgentId }
+          : {}),
+      },
     });
     if (updated && updated.latestRevisionId !== routine.latestRevisionId) {
       await remapRoutineDescriptionAnnotations(req, routine.id);

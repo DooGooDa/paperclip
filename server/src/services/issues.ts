@@ -1035,9 +1035,15 @@ async function listIssueDependencyReadinessMap(
   for (const row of blockerRows) {
     const current = readinessMap.get(row.issueId) ?? createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Only done blockers resolve dependents; cancelled blockers stay unresolved
-    // until an operator removes or replaces the blocker relationship explicitly.
-    if (row.blockerStatus !== "done") {
+    // DGG-11104 (Self-Decide recovery): Both `done` and `cancelled` blockers
+    // resolve the dependent. `cancelled` is an explicit operator/COO decision
+    // ("this dependency is no longer required"), so it must not keep the
+    // dependent blocked. Otherwise reconcile_stranded_assigned_issue keeps
+    // pulling the dependent back to `blocked` after every self-decide PATCH,
+    // creating the recovery-loop diagnosed in #0_standup 2026-05-23 16:22 KST.
+    // The dangling relation is surfaced separately by `classifyIssueGraphLiveness`
+    // (`blocked_by_cancelled_issue`) so operators can still clean up the link.
+    if (row.blockerStatus !== "done" && row.blockerStatus !== "cancelled") {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
       current.allBlockersDone = false;
@@ -1078,8 +1084,10 @@ async function listUnresolvedBlockerIssueIds(
       and(
         eq(issues.companyId, companyId),
         inArray(issues.id, uniqueBlockerIssueIds),
-        // Cancelled blockers intentionally remain unresolved until the relation changes.
-        ne(issues.status, "done"),
+        // DGG-11104: align with listIssueDependencyReadinessMap above.
+        // Both `done` and `cancelled` blockers count as resolved; cancelled
+        // is an explicit operator decision, not a dangling block.
+        notInArray(issues.status, ["done", "cancelled"]),
       ),
     )
     .then((rows) => rows.map((row) => row.id));
@@ -4513,6 +4521,41 @@ export function issueService(db: Db) {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
 
+    /**
+     * Find the most recent manual issue created by the same agent with the same
+     * title within the given minute window. Used for manual-issue governance:
+     * Albert directive (2026-05-28) — 1h same-title dedup to prevent the
+     * sloppy-creation pattern (Kuromi 46% / Batz 67% / Cinna 55% cancel ratio).
+     */
+    findRecentDuplicateByCreatorAndTitle: async (opts: {
+      companyId: string;
+      createdByAgentId: string;
+      title: string;
+      windowMinutes: number;
+    }): Promise<{ id: string; identifier: string | null; createdAt: Date | string } | null> => {
+      const trimmedTitle = (opts.title ?? "").trim();
+      if (!trimmedTitle || !opts.createdByAgentId) return null;
+      const minutes = Math.max(1, Math.floor(opts.windowMinutes));
+      const rows = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          createdAt: issues.createdAt,
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, opts.companyId),
+            eq(issues.createdByAgentId, opts.createdByAgentId),
+            eq(issues.title, trimmedTitle),
+            sql`${issues.createdAt} > now() - (${minutes} || ' minutes')::interval`,
+          ),
+        )
+        .orderBy(desc(issues.createdAt))
+        .limit(1);
+      return rows[0] ?? null;
+    },
+
     list: async (companyId: string, filters?: IssueFilters) => {
       if (filters?.attention === "blocked") {
         return listBlockedInboxIssues(db, companyId, {
@@ -4604,7 +4647,18 @@ export function issueService(db: Db) {
       if (unreadForUserId) {
         conditions.push(unreadForUserCondition(companyId, unreadForUserId));
       }
-      if (filters?.projectId) conditions.push(eq(issues.projectId, filters.projectId));
+      if (filters?.projectId) {
+        const pid = filters.projectId;
+        // Full UUID (36 chars) — exact match. Short ID prefix (8-35 chars) — LIKE match on text cast.
+        // Root-cause fix 2026-05-15: 외부 caller(web UI bookmark/shared URL)가 8-char prefix로 진입 시
+        // useParams가 그대로 추출 → ?projectId=b3061b25 같이 호출되어 invalid uuid 22P02 500. prefix lookup으로 graceful resolve.
+        if (pid.length === 36) {
+          conditions.push(eq(issues.projectId, pid));
+        } else if (pid.length >= 8) {
+          conditions.push(sql`${issues.projectId}::text LIKE ${pid + '%'}`);
+        }
+        // pid.length < 8 — silently skip (too ambiguous, would return whole table)
+      }
       if (filters?.workspaceId) {
         conditions.push(or(
           eq(issues.executionWorkspaceId, filters.workspaceId),

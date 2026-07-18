@@ -1756,7 +1756,15 @@ export function routineService(
       filters?: { projectId?: string | null },
     ): Promise<RoutineListItem[]> => {
       const conditions = [eq(routines.companyId, companyId)];
-      if (filters?.projectId) conditions.push(eq(routines.projectId, filters.projectId));
+      if (filters?.projectId) {
+        const pid = filters.projectId;
+        // UUID prefix lookup (issues.ts와 동일 패턴, 2026-05-15 root-cause fix 확장)
+        if (pid.length === 36) {
+          conditions.push(eq(routines.projectId, pid));
+        } else if (pid.length >= 8) {
+          conditions.push(sql`${routines.projectId}::text LIKE ${pid + '%'}`);
+        }
+      }
 
       const rows = await db
         .select()
@@ -2784,7 +2792,14 @@ export function routineService(
             and(
               eq(routineTriggers.id, row.trigger.id),
               eq(routineTriggers.enabled, true),
-              eq(routineTriggers.nextRunAt, row.trigger.nextRunAt),
+              // Precision-safe optimistic lock: claim only while still due. The old
+              // eq(nextRunAt, <Date read via Drizzle>) silently never matched when
+              // next_run_at held microseconds (Postgres us vs Drizzle JS Date ms rounding),
+              // stranding routines for weeks. lte(nextRunAt, now) preserves the concurrency
+              // guard (a rival claim advances nextRunAt into the future) without depending
+              // on exact timestamp round-trip precision.
+              isNotNull(routineTriggers.nextRunAt),
+              lte(routineTriggers.nextRunAt, now),
             ),
           )
           .returning({ id: routineTriggers.id })

@@ -369,8 +369,8 @@ function buildWakeText(
   payload: WakePayload,
   paperclipEnv: Record<string, string>,
   structuredWakePrompt: string,
+  claimedApiKeyPath: string,
 ): string {
-  const claimedApiKeyPath = "~/.openclaw/workspace/paperclip-claimed-api-key.json";
   const orderedKeys = [
     "PAPERCLIP_RUN_ID",
     "PAPERCLIP_AGENT_ID",
@@ -432,16 +432,42 @@ function buildWakeText(
     "   - Create child issues directly when you know what needs to be done; use POST /api/issues/{issueId}/interactions with kind suggest_tasks, ask_user_questions, or request_confirmation when the board/user must choose, answer, or confirm before you can continue.",
     "   - For plan approval, update the plan document first, then create request_confirmation targeting the latest plan revision with idempotencyKey confirmation:{issueId}:plan:{revisionId}; wait for acceptance before creating implementation subtasks.",
     "   - If blocked, PATCH /api/issues/{issueId} with {\"status\":\"blocked\",\"comment\":\"what is blocked, who owns the unblock, and the next action\"}.",
-    "   - If instructions require a comment, POST /api/issues/{issueId}/comments with {\"body\":\"...\"}.",
     "   - PATCH /api/issues/{issueId} with {\"status\":\"done\",\"comment\":\"what changed and why\"}.",
     "4) If issueId does not exist:",
     "   - GET /api/companies/$PAPERCLIP_COMPANY_ID/issues?assigneeAgentId=$PAPERCLIP_AGENT_ID&status=todo,in_progress,in_review,blocked",
     "   - Pick in_progress first, then in_review when you were woken by a comment, then todo, then blocked, then execute step 3.",
     "",
+    "PROGRESS REPORTING (HARD GOVERNANCE — violations are audited and surfaced to CTO):",
+    "- Default channel for progress / discussion / collaboration = Slack thread reply on the Paperclip plugin's alert message for this issue (find via the plugin notification thread_ts).",
+    "- POST /api/issues/{issueId}/comments on **manual origin issues** is FORBIDDEN for non-COO/EA agents. NO EXCEPTIONS:",
+    "  - NO acknowledgment / ACK comments (\"got it\", \"will do\", \"working on it\", \"진행할게요\", \"확인했습니다\") — acknowledgment is IMPLICIT in starting work.",
+    "  - NO progress comments (\"파일 읽는 중\", \"다음 단계\", \"중간 진행\") — leave durable progress via code/PR/file changes; talk on Slack thread.",
+    "  - NO closing summary comments (\"끝났어요\", \"완료\", \"마무리\") — close via PATCH status transition only.",
+    "- Allowed comment paths (ONLY):",
+    "  - routine_execution origin issues: check-in comment OK — the FIRST LINE must be EXACTLY `picked: <DGG-id|self-initiated <mode>> | action: <one-line verb phrase> | verdict: <pass|fail|silent>` (idle wake: same template with verdict: silent, or the single line `no_task_available — N건 검토`). Summary/details start on line 2. Non-conforming first lines are counted as format drift by checkin-compliance-audit and surfaced to CTO.",
+    "  - COO/EA agents on manual issues: only with whitelist prefixes ([COO], [Epic], [REVERT], Plan locked, Evidence:, PASS (COO), FAIL —, 승격, 재배정).",
+    "- PATCH /api/issues/{issueId} with `comment` field on manual issues: keep under 20 words AND only when transitioning to `blocked` (state + owner + next action) or `done` (what changed in 1 sentence). Otherwise OMIT the comment field entirely.",
+    "- PR description / commit message: code work evidence (diffs, links) belongs here, not in issue comments.",
+    "- Any prose, discussion, question, status update, blocker explanation > 20 words → Slack thread reply, NOT issue comment.",
+    "- Violating: surfaced by `comment-hard-rule-audit`, triggers self-trigger reopen cycles, escalates to CTO directive.",
+    "",
+    "CYCLE COMPLETION CONTRACT (HARD GOVERNANCE — anti-yield, anti-ping-pong):",
+    "- Do NOT yield this wake after a single ack or 1-step report. The 24h baseline shows wake-to-done ratio 0.16-0.26 for executor agents — most wakes only post an ack and immediately yield, creating 22-wake ping-pong loops on a single Epic. STOP THIS PATTERN.",
+    "- Within this wake, execute as many concrete steps as the issue requires (read → analyze → write → verify → commit/PR/PATCH). Use the full wake budget (timeout is 1h, p50 currently 2.9min — that is the bug).",
+    "- Only return from this wake when ONE of these is true:",
+    "  (a) PATCHed status to `done` with evidence (commit hash, PR link, or file path + diff summary)",
+    "  (b) PATCHed status to `blocked` with `comment` field stating owner + specific unblock action needed",
+    "  (c) PATCHed status to `in_review` with PR link + AC checklist results",
+    "  (d) Created child sub-task(s) with clear AC + assignee, AND parent stays `in_progress`",
+    "  (e) Truly exhausted: explicitly state in PATCH `comment` which specific input/decision/file/tool is missing (not vague — e.g., \"blocked: need CTO decision on auth provider Redis vs JWT\" — NOT \"waiting for context\")",
+    "- Forbidden return states: bare ack comment (\"working on it\"), 1-line status update without status transition, \"will continue next wake\", \"queued for follow-up\", silent return.",
+    "- If PM/COO leaves a new comment mid-wake, address it within THIS wake — do not defer to a new wake cycle. Ping-pong = audit violation.",
+    "- Read your AGENTS.md for role-specific cycle expectations. COO/EA may have lighter cycles. Dev/ML/PM executor cycles must produce code/PR/sub-task artifacts.",
+    "",
     "Useful endpoints for issue work:",
-    "- POST /api/issues/{issueId}/comments",
-    "- PATCH /api/issues/{issueId}",
-    "- POST /api/companies/{companyId}/issues (when asked to create a new issue)",
+    "- PATCH /api/issues/{issueId}   (status / blockedBy / done with brief comment field)",
+    "- POST /api/companies/{companyId}/issues   (when asked to create a new issue)",
+    "- POST /api/issues/{issueId}/comments   (USE ONLY per PROGRESS REPORTING rules above — routine check-ins, COO/EA whitelist, or as restricted)",
     ...(structuredWakePrompt
       ? [
           "",
@@ -492,7 +518,10 @@ export function buildAgentParams(input: {
   }
 
   if (typeof agentParams.timeout !== "number") {
-    agentParams.timeout = input.waitTimeoutMs;
+    // DGG fork (#19 9a243697): OpenClaw Gateway expects the agent timeout in
+    // SECONDS, not milliseconds — passing waitTimeoutMs made the gateway wait
+    // ~1000x too long (e.g. 30000s instead of 30s).
+    agentParams.timeout = Math.max(1, Math.ceil(input.waitTimeoutMs / 1000));
   }
 
   return agentParams;
@@ -1092,6 +1121,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     structuredWakeJson
       ? joinWakePayloadSections(structuredWakePrompt, structuredWakeJson)
       : structuredWakePrompt,
+    // per-agent claimed-key 경로 (adapter config override). config 미설정 시 공유 DEFAULT로
+    // backward-compat → cross-agent 토큰 혼선(Cinna가 공유=Badtz 키 읽고 actor-mismatch 거부) 방지.
+    resolveClaimedApiKeyPath(ctx.config.claimedApiKeyPath),
   );
 
   const sessionKeyStrategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);

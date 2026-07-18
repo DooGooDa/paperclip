@@ -28,6 +28,7 @@ export interface IssueLivenessIssueInput {
   executionState?: Record<string, unknown> | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  originKind?: string | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -414,6 +415,11 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     dependencyPath: IssueLivenessIssueInput[],
   ): IssueLivenessFinding | null {
     if (reviewIssue.status !== "in_review") return null;
+    // routine_execution 이슈는 검수자 없이 self-completing (체크인 등) — in_review는
+    // done으로 가는 transient 상태일 뿐 "방치"가 아니다. liveness가 이를 escalate하면
+    // recovery 이슈가 양산되어(일 20~34개) 담당 에이전트를 헛돈 wake로 끌어들인다.
+    // 진짜 방치된 routine_execution은 routine-runs-stuck이 별도로 커버.
+    if (reviewIssue.originKind === "routine_execution") return null;
     if (hasExplicitWaitingPath(reviewIssue)) return null;
 
     const ownerCandidates = ownerCandidatesForRecoveryIssue(reviewIssue, input.agents, agentsById, {

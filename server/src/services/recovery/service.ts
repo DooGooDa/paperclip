@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
@@ -23,6 +23,8 @@ import {
   issueRelations,
   issueThreadInteractions,
   issues,
+  routines,
+  routineTriggers,
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
@@ -101,6 +103,29 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
   60_000,
   Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MS) || 30 * 60 * 1000,
 );
+// DGG-5210: bound automatic stranded recovery so a single stalled issue cannot
+// loop indefinitely. The 24h window is the lifecycle horizon for an automated
+// retry — anything beyond that is a different incident, not the same retry
+// stream. The cap of 3 attempts in that window matches the COO recovery
+// policy: each retry must surface a distinct failure source, otherwise it is
+// dedup'd by the same-source guard below before counting against the budget.
+const STRANDED_RECOVERY_RETRY_BUDGET_WINDOW_MS = 24 * 60 * 60 * 1000;
+const STRANDED_RECOVERY_RETRY_BUDGET_MAX_ATTEMPTS = 3;
+// DGG-5210: same-source retry dedup window. If the most recent automatic
+// recovery attempt for an issue failed with the same error fingerprint inside
+// this window, skip re-issuing another attempt — let it surface to manual
+// intervention through the cap path instead of comment-spamming the issue
+// with another identical retry note.
+const STRANDED_RECOVERY_SAME_SOURCE_DEDUP_WINDOW_MS = 60 * 60 * 1000;
+// DGG-5109 (AC-3): external rate-limit backoff ladder. When a recovery run
+// fails because the upstream provider hit its quota (ChatGPT pro limit /
+// `openclaw_gateway_wait_error` / 429 / RESOURCE_EXHAUSTED), retrying inside
+// 1 minute is wasted work — the upstream window has not refilled yet. We
+// escalate the wait between attempts on a fixed ladder: 5m → 15m → 1h →
+// manual. After the ladder is exhausted the issue is escalated to `blocked`
+// (manual) so the COO/CTO can intervene instead of looping forever.
+const EXTERNAL_RATE_LIMIT_BACKOFF_DELAYS_MS = [5 * 60 * 1000, 15 * 60 * 1000, 60 * 60 * 1000] as const;
+const EXTERNAL_RATE_LIMIT_RECOVERY_REASON = "external_rate_limit_backoff";
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -120,7 +145,7 @@ type RecoveryWakeup = (
 
 type LatestIssueRun = Pick<
   typeof heartbeatRuns.$inferSelect,
-  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState"
+  "id" | "agentId" | "status" | "error" | "errorCode" | "contextSnapshot" | "livenessState" | "createdAt" | "finishedAt"
 > & {
   resultJson?: unknown;
 } | null;
@@ -409,6 +434,48 @@ function isUnsuccessfulTerminalIssueRun(latestRun: LatestIssueRun) {
   );
 }
 
+// DGG-5109 (AC-3): detect external provider rate-limit failures so the
+// reconciler can route them through the backoff ladder instead of the
+// generic immediate-retry path. Sniffs `errorCode`, `error` text, and any
+// stringifiable bits of `contextSnapshot` so adapter-specific failure
+// surfaces still group under the same external bucket.
+function stringifyForRecoveryDetection(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function isExternalRateLimitRun(run: LatestIssueRun) {
+  if (!run) return false;
+  const haystack = [
+    run.errorCode,
+    run.error,
+    stringifyForRecoveryDetection(run.contextSnapshot),
+  ].join("\n").toLowerCase();
+
+  return [
+    "429",
+    "rate limit",
+    "rate_limit",
+    "resource_exhausted",
+    "quota",
+    "usage limit",
+    "pro limit",
+    "chatgpt pro",
+    "openclaw_gateway_wait_error",
+    "gateway_wait_error",
+    "too many requests",
+  ].some((needle) => haystack.includes(needle));
+}
+
+function runTerminalAt(run: LatestIssueRun) {
+  return run?.finishedAt ?? run?.createdAt ?? null;
+}
+
 function isSuccessfulInProgressContinuationRun(latestRun: LatestIssueRun): latestRun is SuccessfulLatestIssueRun {
   return latestRun?.status === "succeeded";
 }
@@ -448,6 +515,8 @@ function livenessRecoveryLeafFingerprint(finding: IssueLivenessFinding) {
 function livenessRecoveryLeafKey(companyId: string, state: string, leafIssueId: string) {
   return buildIssueGraphLivenessLeafKey({ companyId, state, leafIssueId });
 }
+
+const LIVENESS_RECOVERY_REARM_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 function isUniqueLivenessRecoveryConflict(error: unknown) {
   if (!error || typeof error !== "object") return false;
@@ -547,6 +616,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
+        createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -575,6 +646,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         contextSnapshot: heartbeatRuns.contextSnapshot,
         livenessState: heartbeatRuns.livenessState,
         resultJson: heartbeatRuns.resultJson,
+        createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
       })
       .from(heartbeatRuns)
       .where(
@@ -587,6 +660,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  // DGG-5210: pull recent runs for an issue so the stranded-recovery cap and
+  // same-source dedup gate can both reason over them without re-querying. The
+  // window is bounded to STRANDED_RECOVERY_RETRY_BUDGET_WINDOW_MS so old
+  // unrelated retries from a previous incident never count against the cap.
+  async function getRecentIssueRuns(
+    companyId: string,
+    issueId: string,
+    since: Date,
+  ): Promise<NonNullable<LatestIssueRun>[]> {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+        livenessState: heartbeatRuns.livenessState,
+        resultJson: heartbeatRuns.resultJson,
+        createdAt: heartbeatRuns.createdAt,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          gt(heartbeatRuns.createdAt, since),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(100);
   }
 
   async function summarizeRecentContinuationRetries(
@@ -637,8 +744,148 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return { consecutive, latestFinishedAt };
   }
 
+  function isAutomaticStrandedRecoveryRetryReason(value: unknown) {
+    return value === "assignment_recovery" || value === "issue_continuation_needed";
+  }
+
+  // DGG-5210: count automatic stranded-recovery attempts for an issue inside
+  // STRANDED_RECOVERY_RETRY_BUDGET_WINDOW_MS. Used to enforce the
+  // STRANDED_RECOVERY_RETRY_BUDGET_MAX_ATTEMPTS cap before issuing another
+  // retry. Successful runs still count: a productive run that got us back
+  // here means the recovery loop is alive but not making forward progress.
+  async function countRecentAutomaticStrandedRecoveryAttempts(
+    companyId: string,
+    issueId: string,
+    now = new Date(),
+  ) {
+    const since = new Date(now.getTime() - STRANDED_RECOVERY_RETRY_BUDGET_WINDOW_MS);
+    const rows = await getRecentIssueRuns(companyId, issueId, since);
+    return rows.filter((run) => {
+      const ctx = parseObject(run.contextSnapshot);
+      return isAutomaticStrandedRecoveryRetryReason(readNonEmptyString(ctx.retryReason));
+    }).length;
+  }
+
+  // DGG-5210: classify a run's failure source so two retries that fail with
+  // the same root cause can be dedup'd inside
+  // STRANDED_RECOVERY_SAME_SOURCE_DEDUP_WINDOW_MS. The fingerprint prefers the
+  // structured `errorCode` (e.g. `openclaw_gateway_wait_error`) and falls back
+  // to the first line of the human-readable `error` text so loosely-typed
+  // adapter failures still group. Successful runs return `null` so they don't
+  // dedup retries: a productive run that the loop ignored should still be
+  // allowed to bump into the cap on the next failure.
+  function recoveryFailureFingerprint(run: NonNullable<LatestIssueRun>): string | null {
+    if (
+      !UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
+        run.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
+      )
+    ) {
+      return null;
+    }
+    const code = readNonEmptyString(run.errorCode);
+    if (code) return `code:${code}`;
+    const message = readNonEmptyString(run.error);
+    if (message) {
+      const firstLine = message.split(/\r?\n/)[0]?.trim() ?? "";
+      if (firstLine.length > 0) return `msg:${firstLine.slice(0, 200)}`;
+    }
+    return `status:${run.status}`;
+  }
+
+  // DGG-5210: returns true when the most recent automatic stranded-recovery
+  // run for this issue failed with the same fingerprint as `latestRun` inside
+  // the same-source dedup window. Caller should suppress another retry in
+  // that case — the cap path will eventually escalate to `blocked` once the
+  // 3-attempt budget is exhausted, but we shouldn't comment-spam in the
+  // meantime with identical retry notes.
+  async function isSameSourceRetryDuplicate(
+    companyId: string,
+    issueId: string,
+    latestRun: LatestIssueRun,
+    now = new Date(),
+  ) {
+    if (!latestRun) return false;
+    const fingerprint = recoveryFailureFingerprint(latestRun);
+    if (!fingerprint) return false;
+    const since = new Date(now.getTime() - STRANDED_RECOVERY_SAME_SOURCE_DEDUP_WINDOW_MS);
+    const rows = await getRecentIssueRuns(companyId, issueId, since);
+    let matches = 0;
+    for (const run of rows) {
+      if (run.id === latestRun.id) continue;
+      const ctx = parseObject(run.contextSnapshot);
+      if (!isAutomaticStrandedRecoveryRetryReason(readNonEmptyString(ctx.retryReason))) continue;
+      if (recoveryFailureFingerprint(run) === fingerprint) {
+        matches += 1;
+        if (matches >= 1) return true;
+      }
+    }
+    return false;
+  }
+
+  // DGG-5109 (AC-3): collect recent runs for this issue that already failed
+  // because of an external provider rate-limit. Used to count which step of
+  // the backoff ladder we are on, so each cron tick escalates the wait
+  // instead of retrying every minute.
+  async function getRecentExternalRateLimitRuns(
+    companyId: string,
+    issueId: string,
+    now = new Date(),
+  ) {
+    const since = new Date(now.getTime() - STRANDED_RECOVERY_RETRY_BUDGET_WINDOW_MS);
+    const rows = await getRecentIssueRuns(companyId, issueId, since);
+    return rows.filter((run) => isUnsuccessfulTerminalIssueRun(run) && isExternalRateLimitRun(run));
+  }
+
+  // DGG-5109 (AC-3): decide what to do about a run that just failed because
+  // of an external rate-limit. The four outcomes are:
+  //   - none      : not an external rate-limit failure, fall through to the
+  //                 normal recovery path.
+  //   - wait      : the next ladder step has not elapsed yet — skip the
+  //                 recovery without enqueuing another retry.
+  //   - retry_now : the ladder step elapsed; queue the retry through the
+  //                 external_rate_limit_backoff source so the same-source
+  //                 cap counter excludes it from the generic 24h budget.
+  //   - manual    : the ladder is exhausted; escalate to `blocked` so the
+  //                 COO/CTO can intervene.
+  async function evaluateExternalRateLimitBackoff(
+    companyId: string,
+    issueId: string,
+    latestRun: LatestIssueRun,
+    now = new Date(),
+  ) {
+    if (!latestRun || !isUnsuccessfulTerminalIssueRun(latestRun) || !isExternalRateLimitRun(latestRun)) {
+      return { kind: "none" as const };
+    }
+
+    const recentRateLimitRuns = await getRecentExternalRateLimitRuns(companyId, issueId, now);
+    const latestIncluded = recentRateLimitRuns.some((run) => run.id === latestRun.id);
+    const attempt = Math.max(1, recentRateLimitRuns.length + (latestIncluded ? 0 : 1));
+    const delayMs = EXTERNAL_RATE_LIMIT_BACKOFF_DELAYS_MS[attempt - 1];
+    if (typeof delayMs !== "number") {
+      return { kind: "manual" as const, attempt };
+    }
+
+    const completedAt = runTerminalAt(latestRun);
+    if (!completedAt) return { kind: "retry_now" as const, attempt, delayMs };
+    const readyAt = new Date(completedAt.getTime() + delayMs);
+    if (readyAt.getTime() > now.getTime()) {
+      return { kind: "wait" as const, attempt, delayMs, readyAt };
+    }
+
+    return { kind: "retry_now" as const, attempt, delayMs };
+  }
+
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
-    const [run, deferredWake] = await Promise.all([
+    // DGG-5094: also recognise an active routine with a future-scheduled
+    // trigger as a live execution path. Issues waiting on an external
+    // dependency (e.g. CEO return date, scheduled API readiness) keep their
+    // status=in_progress while a cron-driven routine carries the next wake.
+    // Without this guard, reconcileStrandedAssignedIssues misclassifies them
+    // as stranded and triggers a recovery wake-loop (DGG-5074 incident).
+    // A non-terminal child is also a live execution path for delegated parent
+    // work; otherwise parent epics with active subtasks get flipped back to
+    // blocked while the team is still working through the child issues.
+    const [run, issueLockRun, deferredWake, scheduledRoutine, activeChildIssue] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -648,6 +895,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
             agentId ? eq(heartbeatRuns.agentId, agentId) : sql`true`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: heartbeatRuns.id })
+        .from(issues)
+        .innerJoin(
+          heartbeatRuns,
+          sql`${heartbeatRuns.id} = coalesce(${issues.executionRunId}, ${issues.checkoutRunId})`,
+        )
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            eq(issues.id, issueId),
+            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
           ),
         )
         .limit(1)
@@ -665,9 +928,38 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         )
         .limit(1)
         .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: routines.id })
+        .from(routines)
+        .innerJoin(routineTriggers, eq(routineTriggers.routineId, routines.id))
+        .where(
+          and(
+            eq(routines.companyId, companyId),
+            eq(routines.parentIssueId, issueId),
+            eq(routines.status, "active"),
+            eq(routineTriggers.enabled, true),
+            isNotNull(routineTriggers.nextRunAt),
+            gt(routineTriggers.nextRunAt, sql`now()`),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
+      db
+        .select({ id: issues.id })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            eq(issues.parentId, issueId),
+            isNull(issues.hiddenAt),
+            inArray(issues.status, ["todo", "in_progress", "in_review"]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null),
     ]);
 
-    return Boolean(run || deferredWake);
+    return Boolean(run || issueLockRun || deferredWake || scheduledRoutine || activeChildIssue);
   }
 
   async function hasPendingWakeInteraction(companyId: string, issueId: string) {
@@ -2124,6 +2416,142 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     ].join("\n");
   }
 
+  // DGG-5493 (FAIL trail): the run-level cap+dedup from DGG-5210 catches
+  // *runs* but does not bound *recovery sub-issue creation*. When a source
+  // issue is escalated to `blocked`, then user/agent flips it back via
+  // comment-PATCH and the next reconcile tick fires, `findOpenStranded
+  // IssueRecoveryIssue` excludes done/cancelled and AC-3 auto-dones
+  // recovery sub-issues quickly — so each reopen→reconcile cycle spawns a
+  // brand-new sub-issue. Evidence: DGG-5390 saw 7 sub-issues in 23min,
+  // DGG-5088 saw 8 in 24h, DGG-5419 saw a dup 12min apart. We bound this
+  // per source by counting recently-created stranded recovery sub-issues
+  // (regardless of status) inside the existing
+  // STRANDED_RECOVERY_RETRY_BUDGET_WINDOW_MS / SAME_SOURCE_DEDUP_WINDOW_MS.
+  async function countRecentStrandedIssueRecoveryIssuesForSource(
+    companyId: string,
+    sourceIssueId: string,
+    since: Date,
+  ) {
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STRANDED_ISSUE_RECOVERY_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          isNull(issues.hiddenAt),
+          gt(issues.createdAt, since),
+        ),
+      );
+    return rows.length;
+  }
+
+  async function findRecentStrandedIssueRecoveryIssueForSource(
+    companyId: string,
+    sourceIssueId: string,
+    since: Date,
+  ) {
+    return db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STRANDED_ISSUE_RECOVERY_ORIGIN_KIND),
+          eq(issues.originId, sourceIssueId),
+          isNull(issues.hiddenAt),
+          gt(issues.createdAt, since),
+        ),
+      )
+      .orderBy(desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  // DGG-5614: when the run-level cap escalates the source to `blocked`, any
+  // already-open recovery sub-issues for that source become orphaned shells
+  // — paperclip stopped retrying the source, so the sub-issue cannot make
+  // forward progress, but it sits in `todo`/`in_progress` until a human flips
+  // it. Evidence: in a single 24h window MyMelody received 68 sub-issue
+  // assignments and manually done-flipped 26 of them as janitor work, because
+  // BadtzMaru/Cinnamoroll (reports_to=Mel) generate the stranded sources and
+  // recovery owner resolution lands them all on her queue. We auto-cancel
+  // every open sub-issue tied to a source whose retry budget exhausted, so
+  // the recovery owner only sees the source `blocked` (the real signal) and
+  // does not have to clean up the bookkeeping shells.
+  // Skips sub-issues with an active run so we don't yank a recovery that is
+  // mid-execution — those will be picked up by the regular reconcile path on
+  // the next tick once the run terminates.
+  async function cancelOpenStrandedRecoveriesForSource(input: {
+    companyId: string;
+    sourceIssueId: string;
+    reason: string;
+  }) {
+    const openRecoveries = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, input.companyId),
+          eq(issues.originKind, STRANDED_ISSUE_RECOVERY_ORIGIN_KIND),
+          eq(issues.originId, input.sourceIssueId),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+    const result = {
+      cancelled: 0,
+      activeSkipped: 0,
+      cancelledIssueIds: [] as string[],
+    };
+    for (const recovery of openRecoveries) {
+      if (await hasActiveRunForIssueId(recovery.companyId, recovery.id)) {
+        result.activeSkipped += 1;
+        continue;
+      }
+      const previousStatus = recovery.status;
+      const updated = await issuesSvc.update(recovery.id, { status: "cancelled" });
+      if (!updated) continue;
+      await issuesSvc.addComment(
+        recovery.id,
+        [
+          "Paperclip cancelled this stranded-recovery shell because the source issue exhausted its 24h automatic-retry budget and was escalated to `blocked`.",
+          "",
+          `- Cancel reason: \`${input.reason}\``,
+          `- Source issue id: ${input.sourceIssueId}`,
+          `- Previous status: \`${previousStatus}\``,
+          "",
+          "Next action: any further recovery work must be initiated by the recovery owner on the source issue itself — this shell is no longer a useful surface.",
+        ].join("\n"),
+        {},
+      );
+      await logActivity(db, {
+        companyId: input.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: recovery.id,
+        details: {
+          identifier: recovery.identifier,
+          status: "cancelled",
+          previousStatus,
+          source: "recovery.cancel_open_strandeds_on_budget_exhausted",
+          reason: input.reason,
+          sourceIssueId: input.sourceIssueId,
+          originKind: recovery.originKind,
+          originId: recovery.originId,
+        },
+      });
+      result.cancelled += 1;
+      result.cancelledIssueIds.push(recovery.id);
+    }
+    return result;
+  }
+
   async function resolveStrandedIssueRecoveryOwnerAgentId(
     issue: typeof issues.$inferSelect,
     preferredOwnerAgentId?: string | null,
@@ -2257,11 +2685,86 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     previousStatus: StrandedPreviousStatus;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    onCreationDeduped?: () => void;
+    onCreationCapped?: () => void;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) return null;
 
+    // DGG-7354: source-status pre-check.
+    // Refuse to spawn a stranded-recovery sub-issue when the source issue
+    // is already cancelled or done. The stranded-recovery loop assumes the
+    // source needs continuation; a closed source produces a recovery shell
+    // that the dispatcher immediately cancels (blocked-queue noise +
+    // cross-agent dup-wakes). Defense-in-depth: callers (escalateStranded…,
+    // reconcileStrandedAssignedIssues) also gate, but this path is the
+    // canonical creation entry so we lock the invariant here too.
+    if (input.issue.status === "cancelled" || input.issue.status === "done") {
+      logger.info({
+        sourceIssueId: input.issue.id,
+        sourceIdentifier: input.issue.identifier,
+        sourceStatus: input.issue.status,
+        skipReason: "source_status_closed",
+      }, "skipped stranded recovery issue creation: source already closed");
+      return null;
+    }
+
     const existing = await findOpenStrandedIssueRecoveryIssue(input.issue.companyId, input.issue.id);
     if (existing) return existing;
+
+    // DGG-5493: bound recovery sub-issue creation per source. The DGG-5210
+    // run-level cap+dedup (3 runs / 24h, 1h same-source dedup) does not
+    // catch this loop:
+    //   1. reconcile escalates source -> blocked, creates sub-issue.
+    //   2. AC-3 auto-dones the sub-issue once its retry succeeds.
+    //   3. user/agent comment-PATCH flips source back to in_progress.
+    //   4. next reconcile tick sees no OPEN sub-issue (all done) and the
+    //      cap looks at *runs*, not *creations* — spawns a brand-new
+    //      sub-issue.
+    // We add two guards on creation, keyed on the source issue id:
+    //   - 1h window: at most 1 sub-issue created. If one was created in
+    //     the last hour (regardless of its status), reuse it as the
+    //     blocker reference and skip creating a new one. The cap path
+    //     above will catch the run-level loop on subsequent ticks.
+    //   - 24h window: cap at STRANDED_RECOVERY_RETRY_BUDGET_MAX_ATTEMPTS
+    //     so a long-running incident cannot generate >3 sub-issues per
+    //     source, mirroring the run-budget contract.
+    const now = new Date();
+    const dedupSince = new Date(
+      now.getTime() - STRANDED_RECOVERY_SAME_SOURCE_DEDUP_WINDOW_MS,
+    );
+    const recentSubIssue = await findRecentStrandedIssueRecoveryIssueForSource(
+      input.issue.companyId,
+      input.issue.id,
+      dedupSince,
+    );
+    if (recentSubIssue) {
+      input.onCreationDeduped?.();
+      return recentSubIssue;
+    }
+
+    const budgetSince = new Date(
+      now.getTime() - STRANDED_RECOVERY_RETRY_BUDGET_WINDOW_MS,
+    );
+    const recentSubIssueCount = await countRecentStrandedIssueRecoveryIssuesForSource(
+      input.issue.companyId,
+      input.issue.id,
+      budgetSince,
+    );
+    if (recentSubIssueCount >= STRANDED_RECOVERY_RETRY_BUDGET_MAX_ATTEMPTS) {
+      input.onCreationCapped?.();
+      const cappedFallback = await findRecentStrandedIssueRecoveryIssueForSource(
+        input.issue.companyId,
+        input.issue.id,
+        budgetSince,
+      );
+      // Return the most recent sub-issue (even if done/cancelled) so the
+      // escalation comment still has a stable reference, and skip creating
+      // a new shell. The blocker relation will not re-link a closed
+      // sub-issue (existingUnresolvedBlockerIssueIds filters those out),
+      // which is the desired behaviour: source goes blocked, no new sub.
+      if (cappedFallback) return cappedFallback;
+      return null;
+    }
 
     const ownerAgentId = await resolveStrandedIssueRecoveryOwnerAgentId(input.issue);
     if (!ownerAgentId) return null;
@@ -2581,6 +3084,82 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  // DGG-5210 (AC-3): when a recovery issue ("Recover stalled issue ...") has a
+  // successful productive run as its latest run, mark it `done` directly
+  // instead of feeding it back into another stranded-recovery loop. The
+  // recovery issue's job is to surface that the retry succeeded; once it has,
+  // the next-cron tick should not enqueue another retry against the recovery
+  // issue itself. The parent (source) issue keeps its own lifecycle.
+  function buildRecoveryIssueAutoDoneComment(input: {
+    issue: typeof issues.$inferSelect;
+    previousStatus: "todo" | "in_progress";
+    latestRun: NonNullable<LatestIssueRun>;
+    prefix: string;
+  }) {
+    const runLink = runUiLink(
+      { id: input.latestRun.id, agentId: input.latestRun.agentId },
+      input.prefix,
+    );
+    const livenessState = readNonEmptyString(input.latestRun.livenessState) ?? "unknown";
+    return [
+      "Paperclip auto-resolved this recovery issue: the latest retry run finished successfully.",
+      "",
+      `- Recovery issue: ${issueUiLink({ identifier: input.issue.identifier, id: input.issue.id }, input.prefix)}`,
+      `- Previous status: \`${input.previousStatus}\``,
+      `- Latest run: ${runLink}`,
+      `- Latest run status: \`${input.latestRun.status}\``,
+      `- Liveness state: \`${livenessState}\``,
+      "- Action: marking this recovery issue `done` so it does not feed another retry loop.",
+      "",
+      "If the parent (source) issue still needs attention, follow up there directly.",
+    ].join("\n");
+  }
+
+  async function completeStrandedRecoveryIssueInPlace(input: {
+    issue: typeof issues.$inferSelect;
+    previousStatus: "todo" | "in_progress";
+    latestRun: NonNullable<LatestIssueRun>;
+  }) {
+    const updated = await issuesSvc.update(input.issue.id, { status: "done" });
+    if (!updated) return null;
+
+    const prefix = await getCompanyIssuePrefix(input.issue.companyId);
+    await issuesSvc.addComment(
+      input.issue.id,
+      buildRecoveryIssueAutoDoneComment({
+        issue: input.issue,
+        previousStatus: input.previousStatus,
+        latestRun: input.latestRun,
+        prefix,
+      }),
+      {},
+    );
+
+    await logActivity(db, {
+      companyId: input.issue.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: input.issue.id,
+      details: {
+        identifier: input.issue.identifier,
+        status: "done",
+        previousStatus: input.previousStatus,
+        source: "recovery.reconcile_stranded_recovery_issue_auto_done",
+        latestRunId: input.latestRun.id,
+        latestRunStatus: input.latestRun.status,
+        livenessState: input.latestRun.livenessState ?? null,
+        originKind: input.issue.originKind,
+        originId: input.issue.originId,
+      },
+    });
+
+    return updated;
+  }
+
   async function existingBlockerIssueIds(companyId: string, issueId: string) {
     return db
       .select({ blockerIssueId: issueRelations.issueId })
@@ -2669,6 +3248,51 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return updated;
   }
 
+  async function cleanupTerminalBlockerRelations() {
+    const staleRelations = await db
+      .select({
+        companyId: issueRelations.companyId,
+        blockerIssueId: issueRelations.issueId,
+        blockedIssueId: issueRelations.relatedIssueId,
+      })
+      .from(issueRelations)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.companyId, issueRelations.companyId),
+          eq(issues.id, issueRelations.issueId),
+        ),
+      )
+      .where(
+        and(
+          eq(issueRelations.type, "blocks"),
+          inArray(issues.status, ["done", "cancelled"]),
+        ),
+      );
+
+    const byBlockedIssue = new Map<string, { companyId: string; terminalBlockerIds: Set<string> }>();
+    for (const relation of staleRelations) {
+      const current = byBlockedIssue.get(relation.blockedIssueId) ?? {
+        companyId: relation.companyId,
+        terminalBlockerIds: new Set<string>(),
+      };
+      current.terminalBlockerIds.add(relation.blockerIssueId);
+      byBlockedIssue.set(relation.blockedIssueId, current);
+    }
+
+    let removed = 0;
+    const issueIds: string[] = [];
+    for (const [blockedIssueId, entry] of byBlockedIssue.entries()) {
+      const remainingBlockerIds = (await existingBlockerIssueIds(entry.companyId, blockedIssueId))
+        .filter((blockerId) => !entry.terminalBlockerIds.has(blockerId));
+      await issuesSvc.update(blockedIssueId, { blockedByIssueIds: remainingBlockerIds });
+      removed += entry.terminalBlockerIds.size;
+      issueIds.push(blockedIssueId);
+    }
+
+    return { removed, issueIds };
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -2677,6 +3301,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     recoveryCause?: StrandedRecoveryCause;
     recoveryOwnerAgentId?: string | null;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    onRecoveryIssueCreationDeduped?: () => void;
+    onRecoveryIssueCreationCapped?: () => void;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -2687,6 +3313,20 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
+    // DGG-5493/5210: bounded (dedup + cap) recovery sub-issue creation preserves
+    // the fork governance surface and fires the creation callbacks so reconcile
+    // can count dedup/cap outcomes. Upstream's source-scoped recovery action
+    // (below) still drives blocked-status ownership. Skipped for done/cancelled
+    // sources (DGG-7354).
+    if (input.issue.status !== "done" && input.issue.status !== "cancelled") {
+      await ensureStrandedIssueRecoveryIssue({
+        issue: input.issue,
+        previousStatus: input.previousStatus,
+        latestRun: input.latestRun,
+        onCreationDeduped: input.onRecoveryIssueCreationDeduped,
+        onCreationCapped: input.onRecoveryIssueCreationCapped,
+      });
+    }
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
       previousStatus: input.previousStatus,
@@ -2845,6 +3485,18 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function reconcileStrandedAssignedIssues() {
+    // Exclude `routine_execution` candidates: those issues are reborn every cron tick by
+    // routineRunIssueCreator. They are intentionally short-lived dispatch shells, not
+    // long-running work. Treating them as stranded turns each routine fire into a
+    // permanent dup-wake loop (issue → blocked + stranded_issue_recovery sub-issue,
+    // sub-issue itself stays blocked). The routine scheduler is the live execution path
+    // for these; reconcile would only generate noise. Other origins (manual,
+    // stranded_issue_recovery, etc.) remain in scope.
+    // CTO directive 2026-05-23 — [SELF-DECIDE] 마커 박힌 이슈는 recovery 제외.
+    // 4명 워크스페이스 knowledge/domain-decision-discipline.md 자체결정 룰에 따라
+    // 에이전트가 외부 dep 가정 박고 in_progress 전환한 이슈를 recovery가 blocked로
+    // 자동 회귀시키지 않도록 candidate에서 제외. 본인 자율성 보장 + 사후 reverse
+    // 메커니즘은 description 마커 + 24h 안 Lina/CTO 반응으로 처리.
     const candidates = await db
       .select()
       .from(issues)
@@ -2856,8 +3508,17 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
             sql`${issues.assigneeAgentId} is not null`,
             eq(issues.status, "in_review"),
           ),
+          // DGG fork: routine_execution issues have the routine scheduler as their
+          // live execution path — reconcile would only generate dup-wake noise.
+          sql`${issues.originKind} is distinct from 'routine_execution'`,
+          // CTO directive 2026-05-23: exclude [SELF-DECIDE] issues so agents that
+          // intentionally moved to in_progress on an external-dependency assumption
+          // are not auto-reverted to blocked by recovery.
+          sql`(${issues.description} IS NULL OR ${issues.description} NOT LIKE '%[SELF-DECIDE%')`,
         ),
       );
+
+    const now = new Date();
 
     const result = {
       assignmentDispatched: 0,
@@ -2872,7 +3533,30 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       waitingOnReviewResolved: 0,
       recentProgressExempted: 0,
       skipped: 0,
+      sameSourceDedupSkipped: 0,
+      capEscalated: 0,
+      recoveryAutoDone: 0,
+      recoveryIssueCreationDeduped: 0,
+      recoveryIssueCreationCapped: 0,
+      // DGG-5614: open recovery sub-issues auto-cancelled when their source
+      // hit the 24h retry-budget cap. Surfaces the janitor-work reduction in
+      // operational metrics so we can verify the fix moved Mel/Kuromi off
+      // manual cleanup duty.
+      openRecoveriesCancelledOnCapExhaustion: 0,
+      openRecoveriesCancelledActiveSkipped: 0,
+      cancelledRecoveryIssueIds: [] as string[],
+      terminalBlockerRelationsRemoved: 0,
       issueIds: [] as string[],
+    };
+
+    // DGG-5493: ensureStrandedIssueRecoveryIssue exposes its dedup/cap
+    // decision via these collectors so reconcile can record the outcome
+    // for tests / observability without threading another return shape.
+    const onRecoveryIssueCreationDeduped = () => {
+      result.recoveryIssueCreationDeduped += 1;
+    };
+    const onRecoveryIssueCreationCapped = () => {
+      result.recoveryIssueCreationCapped += 1;
     };
 
     for (const issue of candidates) {
@@ -3038,6 +3722,126 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         continue;
       }
 
+      // DGG-5109 (AC-3): if the latest failure is an external provider
+      // rate-limit (ChatGPT pro / openclaw_gateway_wait_error / 429), gate
+      // it through the backoff ladder *before* counting against the generic
+      // 24h cap or enqueuing another retry. 1-minute retries against an
+      // upstream quota are wasted work; the ladder forces 5m / 15m / 1h
+      // waits and finally escalates to manual when exhausted.
+      const externalRateLimitBackoff = await evaluateExternalRateLimitBackoff(
+        issue.companyId,
+        issue.id,
+        latestRun,
+        now,
+      );
+      if (externalRateLimitBackoff.kind === "wait") {
+        result.skipped += 1;
+        continue;
+      }
+      if (externalRateLimitBackoff.kind === "manual") {
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: issue.status as "todo" | "in_progress",
+          latestRun,
+          comment:
+            "Paperclip exhausted the external rate-limit backoff ladder (5m → 15m → 1h → manual) for this " +
+            "issue without recovering. Moving it to `blocked` for manual/COO intervention.",
+          onRecoveryIssueCreationDeduped,
+          onRecoveryIssueCreationCapped,
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
+      // DGG-5210 (AC-2): cap automatic stranded-recovery retries inside the
+      // 24h budget window. When the cap is exhausted the issue must escalate
+      // to `blocked` and stop participating in the retry loop — otherwise
+      // each cron tick comments "Paperclip retried..." indefinitely. We
+      // evaluate the cap *before* the same-source dedup gate so a hot loop
+      // failing on one fingerprint still surfaces an explicit escalation
+      // once the budget is exhausted.
+      const recentRecoveryAttempts = await countRecentAutomaticStrandedRecoveryAttempts(
+        issue.companyId,
+        issue.id,
+        now,
+      );
+      if (recentRecoveryAttempts >= STRANDED_RECOVERY_RETRY_BUDGET_MAX_ATTEMPTS) {
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: issue.status as "todo" | "in_progress",
+          latestRun,
+          comment:
+            "Paperclip paused automatic stranded-work recovery for this issue because the same source issue " +
+            `already consumed ${recentRecoveryAttempts} automatic recovery attempts inside 24h. ` +
+            "Moving it to `blocked` for manual/COO intervention instead of continuing the retry loop.",
+          onRecoveryIssueCreationDeduped,
+          onRecoveryIssueCreationCapped,
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.capEscalated += 1;
+          result.issueIds.push(issue.id);
+          // DGG-5614: source went to `blocked` because the cap is exhausted —
+          // any still-open recovery sub-issue for this source has no path
+          // forward and only generates janitor work for the recovery owner.
+          // Auto-cancel them so the owner sees the source `blocked` signal
+          // without having to flip orphan shells.
+          const cleanup = await cancelOpenStrandedRecoveriesForSource({
+            companyId: issue.companyId,
+            sourceIssueId: issue.id,
+            reason: "retry_budget_exhausted",
+          });
+          result.openRecoveriesCancelledOnCapExhaustion += cleanup.cancelled;
+          result.openRecoveriesCancelledActiveSkipped += cleanup.activeSkipped;
+          result.cancelledRecoveryIssueIds.push(...cleanup.cancelledIssueIds);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
+      // DGG-5210 (AC-1): same-source dedup. If the latest failed run shares
+      // an error fingerprint with another automatic recovery run inside the
+      // 1h dedup window, suppress another retry and let the cap path catch
+      // it on the next loop. The cap above only escalates after
+      // STRANDED_RECOVERY_RETRY_BUDGET_MAX_ATTEMPTS, so this guard prevents
+      // bursty back-to-back duplicate retries between cap evaluations.
+      if (await isSameSourceRetryDuplicate(issue.companyId, issue.id, latestRun, now)) {
+        result.skipped += 1;
+        result.sameSourceDedupSkipped += 1;
+        continue;
+      }
+
+      // DGG-5210 (AC-3): recovery issue + productive successful run = the
+      // retry already did its job. Auto-done the recovery issue so the next
+      // cron tick does not enqueue yet another stranded-recovery loop
+      // against it. We require productive liveness (advanced/completed/
+      // blocked/needs_followup) so a no-op succeeded run still surfaces
+      // through the existing skip path on the next iteration.
+      if (
+        isStrandedIssueRecoveryIssue(issue) &&
+        isSuccessfulInProgressContinuationRun(latestRun) &&
+        isProductiveContinuationRun(latestRun)
+      ) {
+        const updated = await completeStrandedRecoveryIssueInPlace({
+          issue,
+          previousStatus: issue.status as "todo" | "in_progress",
+          latestRun,
+        });
+        if (updated) {
+          result.recoveryAutoDone += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
       if (issue.status === "todo") {
         if (!latestRun) {
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
@@ -3066,6 +3870,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
+          // DGG-5109 (AC-3): if the latest failure is an external rate-limit and
+          // the ladder step has elapsed, requeue the retry through the
+          // external_rate_limit_backoff source so the same-source dedup gate keeps
+          // the ladder count separate from the generic 24h budget.
+          if (externalRateLimitBackoff.kind === "retry_now") {
+            if (await isInvocationBudgetBlocked(issue, agentId)) {
+              result.skipped += 1;
+              continue;
+            }
+
+            const queued = await enqueueStrandedIssueRecovery({
+              issueId: issue.id,
+              agentId,
+              reason: "issue_assignment_recovery",
+              retryReason: "assignment_recovery",
+              source: EXTERNAL_RATE_LIMIT_RECOVERY_REASON,
+              retryOfRunId: latestRun.id,
+            });
+            if (queued) {
+              result.dispatchRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
           const updated = await escalateStrandedAssignedIssue({
             issue,
@@ -3075,6 +3906,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               "Paperclip automatically retried dispatch for this assigned `todo` issue after a lost wake/run, " +
               `but it still has no live execution path.${failureSummary ?? ""} ` +
               "Moving it to `blocked` so it is visible for intervention.",
+            onRecoveryIssueCreationDeduped,
+            onRecoveryIssueCreationCapped,
           });
           if (updated) {
             result.escalated += 1;
@@ -3161,6 +3994,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               comment:
                 "Paperclip automatically retried continuation for this assigned `in_progress` issue and the retry " +
                 "made progress, but it still has no live execution path. Moving it to `blocked` so it is visible for intervention.",
+              onRecoveryIssueCreationDeduped,
+              onRecoveryIssueCreationCapped,
             });
             if (updated) {
               result.escalated += 1;
@@ -3216,6 +4051,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
               "Paperclip detected a non-retryable failure on this issue's continuation run " +
               `(\`${classification.errorCode}\`). Skipping automatic retries and moving it to \`blocked\` ` +
               `so it is visible for intervention.${failureSummary ?? ""}`,
+            onRecoveryIssueCreationDeduped,
+            onRecoveryIssueCreationCapped,
           });
           if (updated) {
             result.escalated += 1;
@@ -3227,6 +4064,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         }
 
         if (didAutomaticRecoveryFail(latestRun, "issue_continuation_needed")) {
+          // DGG-5109 (AC-3): same external rate-limit retry_now branch for
+          // continuation recovery — without it the upstream provider quota path
+          // never reaches the ladder, so each cron tick re-escalates instead of
+          // honouring the 5m → 15m → 1h waits.
+          if (externalRateLimitBackoff.kind === "retry_now") {
+            if (await isInvocationBudgetBlocked(issue, agentId)) {
+              result.skipped += 1;
+              continue;
+            }
+
+            const queued = await enqueueStrandedIssueRecovery({
+              issueId: issue.id,
+              agentId,
+              reason: "issue_continuation_needed",
+              retryReason: "issue_continuation_needed",
+              source: EXTERNAL_RATE_LIMIT_RECOVERY_REASON,
+              retryOfRunId: latestRun!.id,
+            });
+            if (queued) {
+              result.continuationRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else {
+              result.skipped += 1;
+            }
+            continue;
+          }
+
           const { consecutive, latestFinishedAt } = await summarizeRecentContinuationRetries(
             issue.companyId,
             issue.id,
@@ -3246,6 +4110,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
                 "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
                 `execution disappeared, but it still has no live execution path${attemptCopy}.${causeCopy}${failureSummary ?? ""} ` +
                 "Moving it to `blocked` so it is visible for intervention.",
+              onRecoveryIssueCreationDeduped,
+              onRecoveryIssueCreationCapped,
             });
             if (updated) {
               result.escalated += 1;
@@ -3288,6 +4154,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.skipped += 1;
       }
     }
+
+    const terminalBlockerCleanup = await cleanupTerminalBlockerRelations();
+    result.terminalBlockerRelationsRemoved = terminalBlockerCleanup.removed;
+    result.issueIds.push(...terminalBlockerCleanup.issueIds);
 
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
@@ -3374,7 +4244,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           issueId: issues.id,
         })
         .from(issues)
-        .innerJoin(heartbeatRuns, eq(issues.executionRunId, heartbeatRuns.id))
+        .innerJoin(
+          heartbeatRuns,
+          sql`${heartbeatRuns.id} = coalesce(${issues.executionRunId}, ${issues.checkoutRunId})`,
+        )
         .where(
           and(
             isNull(issues.hiddenAt),
@@ -3549,6 +4422,47 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         ),
       );
     return openRecoveries.find((row) => {
+      const parsed = parseLivenessIncidentKey(row.originId);
+      return parsed?.state === finding.state && parsed.leafIssueId === leafIssueId;
+    }) ?? null;
+  }
+
+
+  async function findRecentTerminalLivenessRecoveryIssueForLeaf(finding: IssueLivenessFinding) {
+    const cutoff = new Date(Date.now() - LIVENESS_RECOVERY_REARM_COOLDOWN_MS);
+    const byFingerprint = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, finding.companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          eq(issues.originFingerprint, livenessRecoveryLeafFingerprint(finding)),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["done", "cancelled"]),
+          gte(issues.updatedAt, cutoff),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (byFingerprint) return byFingerprint;
+
+    const leafIssueId = livenessRecoveryLeafIssueId(finding);
+    const recentTerminalRecoveries = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, finding.companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+          isNull(issues.hiddenAt),
+          inArray(issues.status, ["done", "cancelled"]),
+          gte(issues.updatedAt, cutoff),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt));
+    return recentTerminalRecoveries.find((row) => {
       const parsed = parseLivenessIncidentKey(row.originId);
       return parsed?.state === finding.state && parsed.leafIssueId === leafIssueId;
     }) ?? null;
@@ -3927,6 +4841,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows[0] ?? null);
     if (!recoveryIssue) return { kind: "skipped" as const };
 
+    // DGG-7354: source-status pre-check.
+    // The blocker (recoveryIssue here) referenced by the liveness finding may have
+    // already been resolved (done) or intentionally retired (cancelled) by the time
+    // this escalation runs. Creating a new escalation issue against a closed source
+    // produces a unblock ghost — escalation gets cancelled immediately, leaving
+    // blocked-queue noise and dup-wakes for the recovery owner. Skip creation here
+    // and let the obsolete-recovery cleanup or blocker-relation reconcile drop the
+    // stale relation. The source issue's blocker will surface again on the next
+    // tick if it is genuinely live.
+    if (recoveryIssue.status === "cancelled" || recoveryIssue.status === "done") {
+      logger.info({
+        incidentKey: input.finding.incidentKey,
+        sourceIssueId: issue.id,
+        recoveryIssueId: recoveryIssue.id,
+        recoveryStatus: recoveryIssue.status,
+        skipReason: "source_status_closed",
+      }, "skipped issue graph liveness escalation: source already closed");
+      return { kind: "skipped" as const };
+    }
+
     const existing =
       await findOpenLivenessEscalation(issue.companyId, input.finding.incidentKey) ??
       await findOpenLivenessRecoveryIssueForLeaf(input.finding);
@@ -3938,6 +4872,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         runId: input.runId ?? null,
       });
       return { kind: "existing" as const, escalationIssueId: existing.id };
+    }
+
+    const recentTerminal = await findRecentTerminalLivenessRecoveryIssueForLeaf(input.finding);
+    if (recentTerminal) {
+      logger.info({
+        incidentKey: input.finding.incidentKey,
+        sourceIssueId: issue.id,
+        recoveryIssueId: recoveryIssue.id,
+        recentTerminalEscalationIssueId: recentTerminal.id,
+        recentTerminalEscalationStatus: recentTerminal.status,
+        cooldownMs: LIVENESS_RECOVERY_REARM_COOLDOWN_MS,
+      }, "skipped issue graph liveness escalation: recent terminal escalation cooldown");
+      return { kind: "existing" as const, escalationIssueId: recentTerminal.id };
     }
 
     const ownerSelection = await resolveEscalationOwnerAgentId(input.finding, recoveryIssue);
@@ -4290,6 +5237,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const cutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
     const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings);
     const doneRecoveryBlockerCleanup = await retireDoneLivenessRecoveryBlockers();
+    const terminalBlockerCleanup = await cleanupTerminalBlockerRelations();
     const updatedAtByIssueKey = await loadLivenessDependencyUpdatedAtByIssue(findings);
     const result = {
       findings: findings.length,
@@ -4316,10 +5264,12 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       dependencyWakeDeferredOrFailed: 0,
       dependencyWakeEnqueueFailed: 0,
       dependencyWakeIssueIds: [] as string[],
+      terminalBlockerRelationsRemoved: terminalBlockerCleanup.removed,
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
       retiredRecoveryIssueIds: obsoleteRecoveryCleanup.retiredIssueIds,
     };
+    result.issueIds.push(...terminalBlockerCleanup.issueIds);
 
     if (!autoRecoveryEnabled) {
       result.skippedAutoRecoveryDisabled = findings.length;
@@ -4491,5 +5441,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,
+    // DGG-5392: expose dedup gate so heartbeat's releaseIssueExecutionAndPromote
+    // can apply the same fingerprint guard as the reconcile path (single SSOT).
+    isSameSourceRetryDuplicate,
   };
 }

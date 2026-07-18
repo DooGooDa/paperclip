@@ -7,6 +7,12 @@ export function resolveIssueGoalId(input: {
   defaultGoalId: MaybeId;
 }): string | null {
   if (input.goalId) return input.goalId;
+  // Explicit unattached intent: client sent both projectId=null and goalId=null.
+  // Do not auto-attach the default company goal in this case so that callers
+  // (e.g., daily smoke drills) can create truly unattached issues without
+  // polluting unrelated goals. Omitted (undefined) keys keep the legacy
+  // default-goal fallback behavior for normal issue creation flows.
+  if (input.goalId === null && input.projectId === null) return null;
   if (input.projectId) return input.projectGoalId ?? null;
   return input.defaultGoalId ?? null;
 }

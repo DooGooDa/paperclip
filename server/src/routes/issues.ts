@@ -182,6 +182,57 @@ import {
 import { externalObjectService } from "../services/external-objects.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
+
+// 2026-05-26 — DGG-11672 governance follow-up.
+// AGENTS.md "Manual 이슈 POST 금지 Hard Rule" (L268~) server-side enforcement.
+// Executor agents가 origin_kind=manual 이슈에 *whitelist prefix 외* 코멘트 POST 시
+// 403 reject. prompt-only fix(DGG-11699)는 -10% 효과에 그쳐 Batz 231건/24h 폭주
+// 미해결 → 기술적 차단으로 격상. Kuromi(role=ceo) / 본인 생성 / routine_execution
+// / stranded_issue_recovery / 기타 non-manual origin은 자유 통과.
+//
+// Whitelist 출처: ~/.openclaw/workspace-batz-dev/AGENTS.md L268-274 (예외 prefix).
+// 변경 시 server restart 필요. 1주 운영 후 false-reject 데이터로 조정.
+// 2026-05-28 — Albert directive (one-turn override).
+// Manual issue *creation* governance — extends the L92 comment governance
+// (which only blocked POSTed comments). 7d 측정: BadtzMaru 67% / Cinnamoroll 55%
+// / MyMelody 30% / Kuromi 46% self-cancel ratio — prompt-only enforcement 실패.
+// 비-COO agent가 origin_kind=manual issue를 POST하면 403. system origins
+// (routine_execution / harness_liveness_escalation / stranded_issue_recovery /
+// background) + 사람/admin actor는 통과. 추가로 (creator, title) 1h window
+// dedup → 409. Override 가능: env PAPERCLIP_MANUAL_ISSUE_ALLOWED_AGENT_IDS.
+// 변경 시 server restart 필요.
+const MANUAL_ISSUE_SYSTEM_ORIGIN_BYPASS = new Set([
+  "routine_execution",
+  "harness_liveness_escalation",
+  "stranded_issue_recovery",
+  "background",
+]);
+const MANUAL_ISSUE_ALLOWED_AGENT_IDS = new Set(
+  (process.env.PAPERCLIP_MANUAL_ISSUE_ALLOWED_AGENT_IDS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
+const MANUAL_ISSUE_ALLOWED_ROLES = new Set(
+  (process.env.PAPERCLIP_MANUAL_ISSUE_ALLOWED_ROLES ?? "ceo")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean),
+);
+const MANUAL_ISSUE_DEDUP_WINDOW_MINUTES = 60;
+
+const EXECUTOR_MANUAL_COMMENT_WHITELIST_PREFIXES = [
+  "[COO]",
+  "[Epic]",
+  "Plan locked",
+  "Evidence:",
+  "PASS (COO)",
+  "FAIL —",
+  "FAIL -",
+  "승격",
+  "재배정",
+] as const;
+
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
 });
@@ -6355,6 +6406,45 @@ export function issueRoutes(
     }
     await assertIssueEnvironmentSelection(companyId, createBody.executionWorkspaceSettings?.environmentId);
 
+    // === Manual issue creation governance (2026-05-28 Albert directive) ===
+    // POST /api/issues는 사람/admin + 시스템(internal heartbeat/reconcile)이 쓰는 path.
+    // agent actor의 직접 발급은 항상 manual 의도 (originKind는 createIssueSchema에서 strip).
+    // 발급 권한: role IN PAPERCLIP_MANUAL_ISSUE_ALLOWED_ROLES (기본 'ceo') OR
+    //          agent.id IN PAPERCLIP_MANUAL_ISSUE_ALLOWED_AGENT_IDS (override).
+    // 추가로 (creator, title) 1h dedup → 409.
+    if (actor.agentId && !MANUAL_ISSUE_ALLOWED_AGENT_IDS.has(actor.agentId)) {
+      const requesterAgent = await agentsSvc.getById?.(actor.agentId);
+      const role = (requesterAgent?.role ?? "").toLowerCase();
+      if (!MANUAL_ISSUE_ALLOWED_ROLES.has(role)) {
+        throw forbidden(
+          `Manual issue creation restricted to COO. ` +
+            `agent=${requesterAgent?.name ?? actor.agentId} (role=${role || "unknown"}) cannot POST /api/issues. ` +
+            `Use Slack thread reply to #0_standup mentioning Kuromi to request a new issue, ` +
+            `or PATCH/comment on an existing issue instead.`,
+        );
+      }
+    }
+    if (
+      actor.agentId &&
+      typeof req.body.title === "string" &&
+      req.body.title.trim()
+    ) {
+      const dup = await svc.findRecentDuplicateByCreatorAndTitle({
+        companyId,
+        createdByAgentId: actor.agentId,
+        title: req.body.title,
+        windowMinutes: MANUAL_ISSUE_DEDUP_WINDOW_MINUTES,
+      });
+      if (dup) {
+        throw conflict(
+          `Duplicate manual issue within ${MANUAL_ISSUE_DEDUP_WINDOW_MINUTES}min window: ` +
+            `same title already exists as ${dup.identifier ?? dup.id}. ` +
+            `Use PATCH to update the existing issue instead of re-creating.`,
+          { existingIssueId: dup.id, existingIdentifier: dup.identifier },
+        );
+      }
+    }
+
     const executionPolicy = applyActorMonitorScheduledBy(
       normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
@@ -6525,6 +6615,51 @@ export function issueRoutes(
     const currentSerializedChild = serializationContext
       ? await findCurrentSerializedWatchdogChild(parent)
       : null;
+
+    // === Child issue creation governance (2026-05-28 Albert directive) ===
+    // Parent origin이 system(routine_execution/harness_liveness_escalation/...)이면
+    // 시스템 계보 처리 path라 agent actor도 child 발급 허용. parent가 manual이면 child
+    // 발급은 self-dispatch 패턴 (Batz DGG-12365/12366 등 20초 간격 dup) — COO만.
+    const parentOriginKind = typeof parent.originKind === "string" ? parent.originKind : null;
+    const parentOriginIsSystem =
+      parentOriginKind != null && MANUAL_ISSUE_SYSTEM_ORIGIN_BYPASS.has(parentOriginKind);
+    if (
+      actor.agentId &&
+      !parentOriginIsSystem &&
+      !MANUAL_ISSUE_ALLOWED_AGENT_IDS.has(actor.agentId)
+    ) {
+      const requesterAgent = await agentsSvc.getById?.(actor.agentId);
+      const role = (requesterAgent?.role ?? "").toLowerCase();
+      if (!MANUAL_ISSUE_ALLOWED_ROLES.has(role)) {
+        throw forbidden(
+          `Child issue creation restricted to COO when parent is manual. ` +
+            `agent=${requesterAgent?.name ?? actor.agentId} (role=${role || "unknown"}) cannot POST child of manual parent ${parent.identifier ?? parent.id}. ` +
+            `Use Slack thread reply or PATCH to amend the parent issue.`,
+        );
+      }
+    }
+    if (
+      actor.agentId &&
+      !parentOriginIsSystem &&
+      typeof req.body.title === "string" &&
+      req.body.title.trim()
+    ) {
+      const dup = await svc.findRecentDuplicateByCreatorAndTitle({
+        companyId: parent.companyId,
+        createdByAgentId: actor.agentId,
+        title: req.body.title,
+        windowMinutes: MANUAL_ISSUE_DEDUP_WINDOW_MINUTES,
+      });
+      if (dup) {
+        throw conflict(
+          `Duplicate child issue within ${MANUAL_ISSUE_DEDUP_WINDOW_MINUTES}min window: ` +
+            `same title already exists as ${dup.identifier ?? dup.id}. ` +
+            `Use PATCH instead of re-creating.`,
+          { existingIssueId: dup.id, existingIdentifier: dup.identifier },
+        );
+      }
+    }
+
     const executionPolicy = applyActorMonitorScheduledBy(
       normalizeIssueExecutionPolicy(createBody.executionPolicy),
       actor.actorType,
@@ -6935,6 +7070,110 @@ export function issueRoutes(
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, existing, req.body))) return;
 
+    // Executor self-done flip guard (Kuromi COO directive 2026-05-26 cycle 14 fix).
+    // Reject status=done PATCH when:
+    //   (a) actor.type === 'agent' (board/local admin path unaffected), AND
+    //   (b) actorAgent.role !== 'ceo' (COO/CEO whitelist for Final 3-Gate), AND
+    //   (c) existing.assigneeAgentId === actor.agentId (only blocks self-done; reviewer flips OK), AND
+    //   (d) existing.originKind is in MANUAL_DONE_GUARD_KINDS (excludes auto-recovery/routine wakes), AND
+    //   (e) requested status === 'done'.
+    // Rationale: 14-cycle evidence forgery + cross-RR done flip pattern (DGG-11567..11919 24h).
+    // Whitelisted origin kinds for auto-flip: routine_execution, stranded_issue_recovery,
+    // issue_productivity_review, harness_liveness_escalation, blocker_attention_open_recovery.
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      typeof req.body.status === "string" &&
+      req.body.status === "done" &&
+      existing.assigneeAgentId === req.actor.agentId &&
+      existing.originKind === "manual"
+    ) {
+      const actorAgentForGate = await agentsSvc.getById(req.actor.agentId);
+      const isReviewerRole = actorAgentForGate?.role === "ceo";
+      if (!isReviewerRole) {
+        res.status(403).json({
+          error: "Executor cannot self-flip manual issue to done",
+          details: {
+            issueId: existing.id,
+            actorAgentId: req.actor.agentId,
+            assigneeAgentId: existing.assigneeAgentId,
+            originKind: existing.originKind,
+            actorRole: actorAgentForGate?.role ?? null,
+            policy: {
+              rule: "executor-self-done-flip-ban",
+              gateOwner: "ceo-role (COO Final 3-Gate)",
+              whitelistedOriginKinds: [
+                "routine_execution",
+                "stranded_issue_recovery",
+                "issue_productivity_review",
+                "harness_liveness_escalation",
+                "blocker_attention_open_recovery",
+              ],
+              allowedTerminalStatus: ["in_review"],
+              source: "AGENTS.md L341 (이슈 거버넌스: 실행자 done 금지)",
+            },
+          },
+        });
+        return;
+      }
+    }
+
+    // Executor done-revert guard (DGG-11899 thread 1779741393 — Kuromi 2nd warning).
+    // Mirror of the self-done-flip guard above: once an authorized actor
+    // (board / ceo-role / system) commits a done flip, executor agents cannot
+    // retract it via body.status, even with evidence-append intent. Reject
+    // when:
+    //   (a) actor.type === 'agent' (board/system/local-admin path unaffected), AND
+    //   (b) existing.status === 'done' (the COO terminal), AND
+    //   (c) requested body.status is a non-terminal active state
+    //       (in_review / in_progress / todo / blocked — i.e. anything that
+    //        re-opens the issue back into the active workflow). 'cancelled'
+    //       is excluded because it is itself a terminal status and represents
+    //       a deliberate close, not a revert. AND
+    //   (d) actorAgent.role !== 'ceo' (COO/CEO retain reopen privilege via
+    //       this same path; reopenRequested/resumeRequested verbs cover the
+    //       intentional path and run their own assertExplicitResumeIntentAllowed).
+    // Rationale: DGG-11899 — Batz reverted done -> in_review 40s after Kuromi
+    // PASS + done flip, generating harness escalation DGG-11944 and breaking
+    // the COO Final 3-Gate terminal contract. Evidence-append intent must
+    // route through thread reply / comment-only PATCH (no status change),
+    // not via body.status mutation.
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      existing.status === "done" &&
+      typeof req.body.status === "string" &&
+      req.body.status !== "done" &&
+      req.body.status !== "cancelled"
+    ) {
+      const actorAgentForRevertGate = await agentsSvc.getById(req.actor.agentId);
+      const isCeoRole = actorAgentForRevertGate?.role === "ceo";
+      if (!isCeoRole) {
+        res.status(403).json({
+          error: "Executor cannot revert done issue back to active status",
+          details: {
+            issueId: existing.id,
+            currentStatus: existing.status,
+            requestedStatus: req.body.status,
+            actorAgentId: req.actor.agentId,
+            assigneeAgentId: existing.assigneeAgentId,
+            actorRole: actorAgentForRevertGate?.role ?? null,
+            policy: {
+              rule: "executor-done-revert-ban",
+              gateOwner: "ceo-role (COO Final 3-Gate)",
+              allowedTransitions: [
+                "done -> done (no-op)",
+                "done -> cancelled (deliberate close)",
+              ],
+              guidance: "Evidence append → thread reply or comment-only PATCH (status field omitted). Reopen intent → resume/reopen verb with explicit COO approval.",
+              source: "DGG-11899 thread ts=1779741393 (Kuromi 2nd warning)",
+            },
+          },
+        });
+        return;
+      }
+    }
+
     const actor = getActorInfo(req);
     const isClosed = isClosedIssueStatus(existing.status);
     const isBlocked = existing.status === "blocked";
@@ -6969,6 +7208,79 @@ export function issueRoutes(
       await assertLowTrustControlPlaneDenied(req, res, existing.companyId, existing)
     ) {
       return;
+    }
+
+    // Executor manual-comment prefix whitelist guard — PATCH commentBody path.
+    // Mirror of POST /issues/:id/comments guard (DGG-11672 follow-up). PATCH
+    // commentBody는 POST /comments와 동일하게 issue에 코멘트를 박는 path이므로
+    // 동일 prefix 체크 적용. 없으면 agent가 POST 차단 후 PATCH로 우회 가능.
+    if (
+      typeof commentBody === "string" &&
+      commentBody.length > 0 &&
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      existing.originKind === "manual" &&
+      existing.createdByAgentId !== req.actor.agentId
+    ) {
+      const actorAgentForPatchCommentGate = await agentsSvc.getById(req.actor.agentId);
+      const isCeoRolePatchComment = actorAgentForPatchCommentGate?.role === "ceo";
+      if (!isCeoRolePatchComment) {
+        const trimmedPatchBody = commentBody.trimStart();
+        const matchesPatchWhitelist = EXECUTOR_MANUAL_COMMENT_WHITELIST_PREFIXES.some((p) =>
+          trimmedPatchBody.startsWith(p),
+        );
+        // Allow a brief comment ONLY when it accompanies a done/blocked status
+        // transition (≤20 words), per references/shared/issue-comment-hard-rule.md.
+        // Without this, executors hit a dead-end: POST /comments blocked → they
+        // retry via PATCH comment → also blocked → the one legitimate transition
+        // note (blocked: owner+next-action / done: 1-sentence change) can't land.
+        // 2026-06-21 DGG-17552/17559 reject loop (5 rejects) was exactly this.
+        const patchStatusTransition =
+          typeof updateFields.status === "string" &&
+          (updateFields.status === "done" || updateFields.status === "blocked") &&
+          updateFields.status !== existing.status;
+        const patchCommentWordCount = trimmedPatchBody.split(/\s+/).filter(Boolean).length;
+        const allowedTransitionComment = patchStatusTransition && patchCommentWordCount <= 20;
+        if (!matchesPatchWhitelist && !allowedTransitionComment) {
+          await logActivity(db, {
+            companyId: existing.companyId,
+            actorType: "agent",
+            actorId: req.actor.agentId,
+            agentId: req.actor.agentId,
+            runId: req.actor.runId ?? null,
+            action: "issue.comment_rejected",
+            entityType: "issue",
+            entityId: existing.id,
+            details: {
+              identifier: existing.identifier,
+              reason: "executor-manual-comment-prefix-whitelist-blocked",
+              source: "PATCH /issues/:id (comment field)",
+              originKind: existing.originKind,
+              actorRole: actorAgentForPatchCommentGate?.role ?? null,
+              bodyPreview: trimmedPatchBody.slice(0, 120),
+            },
+          });
+          res.status(403).json({
+            error: "Executor cannot post manual non-whitelist comment",
+            details: {
+              issueId: existing.id,
+              originKind: existing.originKind,
+              actorAgentId: req.actor.agentId,
+              actorRole: actorAgentForPatchCommentGate?.role ?? null,
+              bodyPreview: trimmedPatchBody.slice(0, 80),
+              policy: {
+                rule: "executor-manual-comment-prefix-whitelist",
+                whitelistPrefixes: EXECUTOR_MANUAL_COMMENT_WHITELIST_PREFIXES,
+                guidance:
+                  "manual 이슈 본문 코멘트는 whitelist prefix만 허용. PATCH comment 필드는 done/blocked 전환 시 20단어 이하만(blocked: owner+next-action / done: 1문장). 일반 진행 공유는 Slack thread reply로 routing.",
+                source:
+                  "references/shared/issue-comment-hard-rule.md (DGG-11672 follow-up — PATCH commentBody path 우회 차단 + done/blocked 전환 예외)",
+              },
+            },
+          });
+          return;
+        }
+      }
     }
     if (resumeRequested === true && !(await assertExplicitResumeIntentAllowed(req, res, existing))) return;
     if (resumeRequested !== true && reopenRequested === true && req.actor.type === "agent") {
@@ -7881,6 +8193,10 @@ export function issueRoutes(
               taskId: id,
               commentId: comment.id,
               wakeCommentId: comment.id,
+              // Self-comment guard 정보 — heartbeat deferred reopen 로직에서 사용.
+              // board adapter 경유 PATCH(actor=user)도 원 작성자가 agent면 본인 값 보존.
+              commentAuthorAgentId: actorIsAgent ? actor.actorId : null,
+              commentAuthorActorType: actor.actorType,
               source: reopened ? "issue.comment.reopen" : "issue.comment",
               wakeReason: reopened ? "issue_reopened_via_comment" : "issue_commented",
               ...(reopened ? { reopenedFrom: reopenFromStatus } : {}),
@@ -8870,6 +9186,76 @@ export function issueRoutes(
       presentation: req.body.presentation,
       metadata: req.body.metadata,
     })) return;
+
+    // Executor manual-comment prefix whitelist guard (DGG-11672 follow-up).
+    // Reject 403 when:
+    //   (a) actor.type === 'agent' (board/system/local-admin path unaffected), AND
+    //   (b) issue.originKind === 'manual' (routine_execution / stranded_issue_recovery
+    //       / issue_productivity_review / harness_liveness_escalation /
+    //       blocker_attention_open_recovery 자유 통과), AND
+    //   (c) actor.agentId !== issue.createdByAgentId (본인 생성 이슈는 자유 — Kuromi
+    //       directive 이슈도 본인 발급 path로 자유), AND
+    //   (d) actorAgent.role !== 'ceo' (Kuromi 자유, 본인 자가 정정 path 유지), AND
+    //   (e) body가 whitelist prefix 매칭 안 함.
+    // 진행 공유 의도는 PATCH /issues/{id}의 comment 필드 (activity-log 분리) 또는
+    // Slack thread reply로 routing. 동일 guard가 PATCH commentBody path에도 박혀
+    // 우회 차단.
+    if (
+      req.actor.type === "agent" &&
+      req.actor.agentId &&
+      issue.originKind === "manual" &&
+      issue.createdByAgentId !== req.actor.agentId &&
+      typeof req.body.body === "string"
+    ) {
+      const actorAgentForCommentGate = await agentsSvc.getById(req.actor.agentId);
+      const isCeoRole = actorAgentForCommentGate?.role === "ceo";
+      if (!isCeoRole) {
+        const trimmedBody = req.body.body.trimStart();
+        const matchesWhitelist = EXECUTOR_MANUAL_COMMENT_WHITELIST_PREFIXES.some((p) =>
+          trimmedBody.startsWith(p),
+        );
+        if (!matchesWhitelist) {
+          await logActivity(db, {
+            companyId: issue.companyId,
+            actorType: "agent",
+            actorId: req.actor.agentId,
+            agentId: req.actor.agentId,
+            runId: req.actor.runId ?? null,
+            action: "issue.comment_rejected",
+            entityType: "issue",
+            entityId: issue.id,
+            details: {
+              identifier: issue.identifier,
+              reason: "executor-manual-comment-prefix-whitelist-blocked",
+              source: "POST /issues/:id/comments",
+              originKind: issue.originKind,
+              actorRole: actorAgentForCommentGate?.role ?? null,
+              bodyPreview: trimmedBody.slice(0, 120),
+            },
+          });
+          res.status(403).json({
+            error: "Executor cannot post manual non-whitelist comment",
+            details: {
+              issueId: issue.id,
+              originKind: issue.originKind,
+              actorAgentId: req.actor.agentId,
+              actorRole: actorAgentForCommentGate?.role ?? null,
+              bodyPreview: trimmedBody.slice(0, 80),
+              policy: {
+                rule: "executor-manual-comment-prefix-whitelist",
+                whitelistPrefixes: EXECUTOR_MANUAL_COMMENT_WHITELIST_PREFIXES,
+                guidance:
+                  "진행 공유는 Slack thread reply로 routing(manual 이슈 본문 코멘트는 whitelist prefix만 허용). PATCH comment 필드는 진행 보고 우회용이 아니다 — done/blocked 전환 시 20단어 이하 transition note만 허용된다.",
+                source:
+                  "references/shared/issue-comment-hard-rule.md (DGG-11672 follow-up — prompt-only 효과 -10% 한계, PATCH 우회 dead-end 제거)",
+              },
+            },
+          });
+          return;
+        }
+      }
+    }
+
     const closedExecutionWorkspace = await getClosedIssueExecutionWorkspace(issue);
     if (closedExecutionWorkspace) {
       respondClosedIssueExecutionWorkspace(res, closedExecutionWorkspace);
@@ -9338,6 +9724,9 @@ export function issueRoutes(
               taskId: currentIssue.id,
               commentId: comment.id,
               wakeCommentId: comment.id,
+              // Self-comment guard — heartbeat deferred reopen 로직에서 사용.
+              commentAuthorAgentId: actorIsAgent ? actor.actorId : null,
+              commentAuthorActorType: actor.actorType,
               source: "issue.comment.reopen",
               wakeReason: "issue_reopened_via_comment",
               reopenedFrom: reopenFromStatus,
@@ -9364,6 +9753,9 @@ export function issueRoutes(
               taskId: currentIssue.id,
               commentId: comment.id,
               wakeCommentId: comment.id,
+              // Self-comment guard — heartbeat deferred reopen 로직에서 사용.
+              commentAuthorAgentId: actorIsAgent ? actor.actorId : null,
+              commentAuthorActorType: actor.actorType,
               source: "issue.comment",
               wakeReason: "issue_commented",
               ...(resumeRequested === true ? { resumeIntent: true, followUpRequested: true } : {}),

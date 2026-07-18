@@ -17,6 +17,58 @@ function readCommentText(value: unknown) {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+// Single-token noise guard for auto-issue-comments derived from run summary.
+// Background (DGG noise bug, 2026-05-30): when an agent ends a routine_execution
+// wake with a single character such as `N`, `Y`, `OK`, `.`, the adapter forwards
+// that as `resultJson.summary`, and the server posts it as an issue comment.
+// That produces dozens of meaningless `N` comments per day per agent. We never
+// want to auto-post such terminal noise; the agent can still write a useful
+// comment explicitly via PATCH/POST.
+const SINGLE_TOKEN_NOISE_COMMENT_MIN_CHARS = 10;
+const SINGLE_TOKEN_NOISE_COMMENT_BLOCKLIST: readonly string[] = [
+  "n",
+  "y",
+  "ok",
+  "k",
+  "yes",
+  "no",
+  "...",
+  "..",
+  ".",
+  "-",
+  "--",
+  "done",
+  "pass",
+  "fail",
+  "true",
+  "false",
+  "silent",
+  "noop",
+  "none",
+  "null",
+];
+
+function isSingleTokenNoiseComment(text: string): boolean {
+  const collapsed = text.trim();
+  if (collapsed.length === 0) return true;
+  if (collapsed.length >= SINGLE_TOKEN_NOISE_COMMENT_MIN_CHARS) return false;
+  // Reject anything that is a single word/token with no whitespace and is
+  // either in the noise blocklist or has no informational structure
+  // (no colon, no digit, no slash, no hyphenated id).
+  if (/\s/.test(collapsed)) return false;
+  const lowered = collapsed.toLowerCase();
+  if (SINGLE_TOKEN_NOISE_COMMENT_BLOCKLIST.includes(lowered)) return true;
+  // Bare single-token with no informational punctuation/structure → noise.
+  return !/[:\/=]|\d/.test(collapsed);
+}
+
+export function readIssueCommentCandidate(value: unknown): string | null {
+  const text = readCommentText(value);
+  if (text === null) return null;
+  if (isSingleTokenNoiseComment(text)) return null;
+  return text;
+}
+
 export function mergeHeartbeatRunResultJson(
   resultJson: Record<string, unknown> | null | undefined,
   summary: string | null | undefined,
@@ -100,9 +152,9 @@ export function buildHeartbeatRunIssueComment(
   }
 
   return (
-    readCommentText(resultJson.summary)
-    ?? readCommentText(resultJson.result)
-    ?? readCommentText(resultJson.message)
+    readIssueCommentCandidate(resultJson.summary)
+    ?? readIssueCommentCandidate(resultJson.result)
+    ?? readIssueCommentCandidate(resultJson.message)
     ?? null
   );
 }

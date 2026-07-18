@@ -703,6 +703,44 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(escalations).toHaveLength(1);
   });
 
+  it("treats an active checkoutRunId on the leaf blocker as a live execution path", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      status: "running",
+      contextSnapshot: { issueId: blockedIssueId },
+    });
+    await db.update(issues).set({ checkoutRunId: runId }).where(eq(issues.id, blockerIssueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(0);
+    expect(result.escalationsCreated).toBe(0);
+  });
+
+  it("removes terminal blocker relations during liveness reconciliation", async () => {
+    await enableAutoRecovery();
+    const { companyId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerIssueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(0);
+    expect(result.escalationsCreated).toBe(0);
+    expect(result.terminalBlockerRelationsRemoved).toBe(1);
+    const blockers = await db
+      .select({ blockerIssueId: issueRelations.issueId })
+      .from(issueRelations)
+      .where(eq(issueRelations.relatedIssueId, blockedIssueId));
+    expect(blockers).toHaveLength(0);
+  });
+
   it("creates one manager escalation, preserves blockers, and records owner selection", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
@@ -1038,7 +1076,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     );
   });
 
-  it("creates a fresh escalation when the previous matching escalation is terminal", async () => {
+  it("suppresses a fresh escalation when the previous matching escalation just reached terminal state", async () => {
     await enableAutoRecovery();
     const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
     const heartbeat = heartbeatService(db);
@@ -1057,7 +1095,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       title: "Closed escalation",
       status: "done",
       priority: "high",
-      parentId: blockedIssueId,
+      parentId: blockerIssueId,
       assigneeAgentId: managerId,
       issueNumber: 3,
       identifier: "CLOSED-3",
@@ -1067,33 +1105,69 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
     const result = await heartbeat.reconcileIssueGraphLiveness();
 
-    expect(result.escalationsCreated).toBe(1);
-    expect(result.existingEscalations).toBe(0);
+    expect(result.escalationsCreated).toBe(0);
+    expect(result.existingEscalations).toBe(1);
 
-    const openEscalations = await db
+    const escalations = await db
       .select()
       .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, companyId),
-          eq(issues.originKind, "harness_liveness_escalation"),
-          eq(issues.originId, incidentKey),
-        ),
-      );
-    expect(openEscalations).toHaveLength(2);
-    const freshEscalation = openEscalations.find((issue) => issue.status !== "done");
-    expect(freshEscalation).toMatchObject({
-      parentId: blockerIssueId,
-      assigneeAgentId: managerId,
-      status: expect.stringMatching(/^(todo|in_progress|done)$/),
-    });
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]?.id).toBe(closedEscalationId);
 
     const blockers = await db
       .select({ blockerIssueId: issueRelations.issueId })
       .from(issueRelations)
       .where(eq(issueRelations.relatedIssueId, blockedIssueId));
     expect(blockers.some((row) => row.blockerIssueId === closedEscalationId)).toBe(false);
-    expect(blockers.some((row) => row.blockerIssueId === freshEscalation?.id)).toBe(true);
+  });
+
+  it("creates a fresh escalation when the previous matching terminal escalation is outside cooldown", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, blockerIssueId } = await seedBlockedChain();
+    const heartbeat = heartbeatService(db);
+    const incidentKey = [
+      "harness_liveness",
+      companyId,
+      blockedIssueId,
+      "blocked_by_unassigned_issue",
+      blockerIssueId,
+    ].join(":");
+    const closedEscalationId = randomUUID();
+    const oldTimestamp = new Date(Date.now() - 25 * 60 * 60 * 1000);
+
+    await db.insert(issues).values({
+      id: closedEscalationId,
+      companyId,
+      title: "Closed escalation",
+      status: "done",
+      priority: "high",
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      issueNumber: 3,
+      identifier: "CLOSED-3",
+      originKind: "harness_liveness_escalation",
+      originId: incidentKey,
+      createdAt: oldTimestamp,
+      updatedAt: oldTimestamp,
+    });
+
+    const result = await heartbeat.reconcileIssueGraphLiveness();
+
+    expect(result.escalationsCreated).toBe(1);
+    expect(result.existingEscalations).toBe(0);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations).toHaveLength(2);
+    const freshEscalation = escalations.find((issue) => issue.status !== "done");
+    expect(freshEscalation).toMatchObject({
+      parentId: blockerIssueId,
+      assigneeAgentId: managerId,
+      status: expect.stringMatching(/^(todo|in_progress|done)$/),
+    });
   });
 
   it("removes closed liveness escalations from blocker relations during reconciliation", async () => {

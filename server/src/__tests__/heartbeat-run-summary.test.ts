@@ -56,12 +56,46 @@ describe("buildHeartbeatRunIssueComment", () => {
   });
 
   it("falls back to result or message when summary is missing", () => {
-    expect(buildHeartbeatRunIssueComment({ result: "done" })).toBe("done");
-    expect(buildHeartbeatRunIssueComment({ message: "completed" })).toBe("completed");
+    expect(
+      buildHeartbeatRunIssueComment({ result: "done: posted PR #128, see https://example.com/pr/128" }),
+    ).toBe("done: posted PR #128, see https://example.com/pr/128");
+    expect(
+      buildHeartbeatRunIssueComment({ message: "completed sync of 12 issues, 0 errors" }),
+    ).toBe("completed sync of 12 issues, 0 errors");
   });
 
   it("returns null when there is no usable final text", () => {
     expect(buildHeartbeatRunIssueComment({ costUsd: 1.2 })).toBeNull();
+  });
+
+  it("drops single-token noise such as 'N', 'Y', 'OK', '.', 'done'", () => {
+    // Background: agents sometimes terminate a wake with a single-character
+    // assistant message ('N', 'Y', '...'). The adapter forwards that as
+    // resultJson.summary, and prior to the guard the server posted it as an
+    // issue comment. That produced dozens of useless 'N' comments per day.
+    expect(buildHeartbeatRunIssueComment({ summary: "N" })).toBeNull();
+    expect(buildHeartbeatRunIssueComment({ summary: "Y" })).toBeNull();
+    expect(buildHeartbeatRunIssueComment({ summary: "OK" })).toBeNull();
+    expect(buildHeartbeatRunIssueComment({ summary: "..." })).toBeNull();
+    expect(buildHeartbeatRunIssueComment({ summary: "done" })).toBeNull();
+    expect(buildHeartbeatRunIssueComment({ summary: "pass" })).toBeNull();
+    expect(buildHeartbeatRunIssueComment({ summary: "silent" })).toBeNull();
+    expect(buildHeartbeatRunIssueComment({ summary: "  N  " })).toBeNull();
+  });
+
+  it("keeps short summaries that carry information (digits, urls, ids, colon)", () => {
+    // A summary that is short but informational should still be posted.
+    expect(buildHeartbeatRunIssueComment({ summary: "PR #128" })).toBe("PR #128");
+    expect(buildHeartbeatRunIssueComment({ summary: "DGG-1234" })).toBe("DGG-1234");
+    expect(buildHeartbeatRunIssueComment({ summary: "status: done" })).toBe("status: done");
+  });
+
+  it("falls through noise summary to the next informative field", () => {
+    // When summary is noise but result/message has real content,
+    // we should post the informative fallback.
+    expect(
+      buildHeartbeatRunIssueComment({ summary: "N", result: "posted comment on DGG-1234" }),
+    ).toBe("posted comment on DGG-1234");
   });
 });
 

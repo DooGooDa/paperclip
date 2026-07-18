@@ -415,6 +415,26 @@ describe("issue graph liveness classifier", () => {
     ]);
   });
 
+  it("does not flag routine_execution issues in_review (self-completing, transient)", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: "checkin-1",
+          identifier: "DGG-13370",
+          title: "ML/DS 체크인",
+          status: "in_review",
+          assigneeAgentId: coderId,
+          executionState: null,
+          originKind: "routine_execution",
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(0);
+  });
+
   it("does not flag healthy in_review issues with an explicit action path", () => {
     const reviewIssueId = "review-1";
     const baseReviewIssue = issue({
