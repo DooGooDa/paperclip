@@ -1427,7 +1427,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           const activeRunIds = Array.from(extractRunIdSet(activeSession));
           await ctx.onLog(
             "stdout",
-            `[openclaw-gateway] active session gate suppressed duplicate issue wake sessionKey=${sessionKey} activeRunIds=${activeRunIds.join(",") || "unknown"}\n`,
+            `[openclaw-gateway] active session gate suppressed duplicate issue wake issueId=${wakePayload.issueId} assigneeAgentId=${configuredAgentId ?? "unknown"} hostUrl=${urlValue} sessionKey=${sessionKey} activeRunIds=${activeRunIds.join(",") || "unknown"}\n`,
           );
 
           let notificationStatus: "sent" | "failed" | "disabled" = "disabled";
