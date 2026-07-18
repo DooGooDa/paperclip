@@ -5113,6 +5113,73 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+  // Observation-only governance check (b4684db9 AC-2): flags issues that hold
+  // more than one active execution session (queued/running/scheduled_retry) at
+  // once — the duplicate-active-session violation the dispatch gate
+  // (enqueueWakeup FOR UPDATE + coalesce) is meant to prevent. This never mutates
+  // lock state; it surfaces the violation via the activity log
+  // (issue.duplicate_active_sessions) + logger.warn so the existing standup alert
+  // path can fire once the fleet resumes. Idempotent read.
+  async function detectDuplicateActiveIssueSessions() {
+    const result = {
+      detected: 0,
+      issueIds: [] as string[],
+    };
+
+    const issueIdExpr = sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
+    const violations = await db
+      .select({
+        issueId: issueIdExpr,
+        companyId: heartbeatRuns.companyId,
+        activeCount: sql<number>`count(*)::int`,
+        activeRunIds: sql<
+          string[]
+        >`array_agg(${heartbeatRuns.id}::text order by ${heartbeatRuns.createdAt})`,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' is not null`,
+        ),
+      )
+      .groupBy(issueIdExpr, heartbeatRuns.companyId)
+      .having(sql`count(*) > 1`);
+
+    for (const violation of violations) {
+      if (!violation.issueId) continue;
+
+      result.detected += 1;
+      result.issueIds.push(violation.issueId);
+
+      await logActivity(db, {
+        companyId: violation.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.duplicate_active_sessions",
+        entityType: "issue",
+        entityId: violation.issueId,
+        details: {
+          source: "recovery.detect_duplicate_active_issue_sessions",
+          activeCount: violation.activeCount,
+          activeRunIds: violation.activeRunIds,
+          activeStatuses: [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES],
+        },
+      });
+    }
+
+    if (result.detected > 0) {
+      logger.warn(
+        { detected: result.detected, issueIds: result.issueIds },
+        "detected issues with more than one active execution session",
+      );
+    }
+
+    return result;
+  }
+
   return {
     buildRunOutputSilence,
     escalateStrandedRecoveryIssueInPlace,
@@ -5121,6 +5188,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     scanSilentActiveRuns,
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
+    detectDuplicateActiveIssueSessions,
     buildIssueGraphLivenessAutoRecoveryPreview,
     reconcileIssueGraphLiveness,
     readRecoveryTimerIntervalMs,

@@ -886,6 +886,14 @@ export async function startServer(): Promise<StartedServer> {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
 
+        const duplicateSessions = await heartbeat.detectDuplicateActiveIssueSessions();
+        if (duplicateSessions.detected > 0) {
+          logger.warn(
+            { ...duplicateSessions },
+            "startup duplicate active issue-session detector found violations",
+          );
+        }
+
         const reviewed = await heartbeat.reconcileProductivityReviews();
         if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
           logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
@@ -989,6 +997,15 @@ export async function startServer(): Promise<StartedServer> {
             const swept = await heartbeat.sweepStaleIssueLocks();
             if (swept.cleared > 0) {
               logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+            }
+          })
+          .then(async () => {
+            const duplicateSessions = await heartbeat.detectDuplicateActiveIssueSessions();
+            if (duplicateSessions.detected > 0) {
+              logger.warn(
+                { ...duplicateSessions },
+                "periodic duplicate active issue-session detector found violations",
+              );
             }
           })
           .then(async () => {

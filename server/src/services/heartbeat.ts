@@ -9896,6 +9896,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return recovery.sweepStaleIssueLocks();
   }
 
+  async function detectDuplicateActiveIssueSessions() {
+    return recovery.detectDuplicateActiveIssueSessions();
+  }
+
   function issueIdFromRunContext(contextSnapshot: unknown) {
     const context = parseObject(contextSnapshot);
     return readNonEmptyString(context.issueId) ?? readNonEmptyString(context.taskId);
@@ -14811,6 +14815,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileStrandedAssignedIssues,
 
     sweepStaleIssueLocks,
+    detectDuplicateActiveIssueSessions,
 
     // DGG-7354: expose direct escalation entry so tests can drive a
     // closed-source escalation path without going through the candidate
