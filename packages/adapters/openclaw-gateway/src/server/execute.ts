@@ -1410,7 +1410,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         true,
       );
 
-      if (sameIssueActiveSessionGate && sessionKeyStrategy === "issue" && wakePayload.issueId) {
+      const helloFeatures = asRecord(asRecord(hello)?.features);
+      const helloMethods = Array.isArray(helloFeatures?.methods) ? helloFeatures.methods : [];
+      const supportsSessionsList = helloMethods.includes("sessions.list");
+
+      if (sameIssueActiveSessionGate && sessionKeyStrategy === "issue" && wakePayload.issueId && supportsSessionsList) {
         const sessionsPayload = await client.request<Record<string, unknown>>(
           "sessions.list",
           {

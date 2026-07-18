@@ -28,6 +28,13 @@ async function closeDbClient(db: ReturnType<typeof createDb> | undefined) {
   await db?.$client?.end?.({ timeout: 0 });
 }
 
+function extractPaperclipWake(payload: Record<string, unknown>) {
+  const prompt = String(payload.extraSystemPrompt ?? "");
+  const match = prompt.match(/<!--PAPERCLIP_PAYLOAD_V1 (.*?) -->/s);
+  if (!match) return undefined;
+  return (JSON.parse(match[1]!) as { wake?: unknown }).wake;
+}
+
 async function createControlledGatewayServer() {
   const server = createServer();
   const wss = new WebSocketServer({ server });
@@ -447,11 +454,9 @@ describe("heartbeat comment wake batching", () => {
       }, 90_000);
 
       const secondPayload = gateway.getAgentPayloads()[1] ?? {};
-      expect(secondPayload.paperclip).toMatchObject({
-        wake: {
-          commentIds: [comment2.id, comment3.id],
-          latestCommentId: comment3.id,
-        },
+      expect(extractPaperclipWake(secondPayload)).toMatchObject({
+        commentIds: [comment2.id, comment3.id],
+        latestCommentId: comment3.id,
       });
       expect(String(secondPayload.message ?? "")).toContain("Second comment");
       expect(String(secondPayload.message ?? "")).toContain("Third comment");
@@ -570,21 +575,19 @@ describe("heartbeat comment wake batching", () => {
 
       await waitFor(() => gateway.getAgentPayloads().length === 2);
       const promotedPayload = gateway.getAgentPayloads()[1] ?? {};
-      expect(promotedPayload.paperclip).toMatchObject({
-        wake: {
-          commentIds: [queuedComment.id],
-          latestCommentId: queuedComment.id,
-          comments: [
-            expect.objectContaining({
-              id: queuedComment.id,
-              body: "Queued follow-up",
-            }),
-          ],
-          commentWindow: {
-            requestedCount: 1,
-            includedCount: 1,
-            missingCount: 0,
-          },
+      expect(extractPaperclipWake(promotedPayload)).toMatchObject({
+        commentIds: [queuedComment.id],
+        latestCommentId: queuedComment.id,
+        comments: [
+          expect.objectContaining({
+            id: queuedComment.id,
+            body: "Queued follow-up",
+          }),
+        ],
+        commentWindow: {
+          requestedCount: 1,
+          includedCount: 1,
+          missingCount: 0,
         },
       });
       expect(String(promotedPayload.message ?? "")).toContain("Queued follow-up");
@@ -765,9 +768,8 @@ describe("heartbeat comment wake batching", () => {
       });
 
       const secondPayload = gateway.getAgentPayloads()[1] ?? {};
-      expect(secondPayload.paperclip).toMatchObject({
-        wake: {
-          reason: "issue_commented",
+      expect(extractPaperclipWake(secondPayload)).toMatchObject({
+        reason: "issue_commented",
           commentIds: [comment2.id],
           latestCommentId: comment2.id,
           issue: {
@@ -777,7 +779,6 @@ describe("heartbeat comment wake batching", () => {
             status: "in_progress",
             priority: "medium",
           },
-        },
       });
       expect(String(secondPayload.message ?? "")).toContain("Please handle this follow-up after you finish");
     } finally {
@@ -965,9 +966,8 @@ describe("heartbeat comment wake batching", () => {
       expect(issueAfterPromotion?.completedAt).not.toBeNull();
 
       const secondPayload = gateway.getAgentPayloads()[1] ?? {};
-      expect(secondPayload.paperclip).toMatchObject({
-        wake: {
-          reason: "issue_comment_mentioned",
+      expect(extractPaperclipWake(secondPayload)).toMatchObject({
+        reason: "issue_comment_mentioned",
           commentIds: [comment.id],
           latestCommentId: comment.id,
           issue: {
@@ -977,7 +977,6 @@ describe("heartbeat comment wake batching", () => {
             status: "done",
             priority: "medium",
           },
-        },
       });
       expect(String(secondPayload.message ?? "")).toContain("please review after I finish");
     } finally {
@@ -1051,9 +1050,8 @@ describe("heartbeat comment wake batching", () => {
       expect(firstRun).not.toBeNull();
       await waitFor(() => gateway.getAgentPayloads().length === 1);
       const firstPayload = gateway.getAgentPayloads()[0] ?? {};
-      expect(firstPayload.paperclip).toMatchObject({
-        wake: {
-          reason: "issue_assigned",
+      expect(extractPaperclipWake(firstPayload)).toMatchObject({
+        reason: "issue_assigned",
           issue: {
             id: issueId,
             identifier: `${issuePrefix}-1`,
@@ -1063,7 +1061,6 @@ describe("heartbeat comment wake batching", () => {
           },
           checkedOutByHarness: true,
           commentIds: [],
-        },
       });
       expect(String(firstPayload.message ?? "")).toContain("## Paperclip Wake Payload");
       expect(String(firstPayload.message ?? "")).toContain("Do not switch to another issue until you have handled this wake.");
