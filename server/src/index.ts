@@ -55,6 +55,7 @@ import {
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { ADVISORY_LOCK_KEYS, runWithAdvisoryLock } from "./services/advisory-lock.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -917,29 +918,35 @@ export async function startServer(): Promise<StartedServer> {
         );
       }
 
-      if (!resolveHeartbeatSchedulingSuppression().suppressed) {
-        void heartbeat
-          .tickTimers(new Date())
-          .then((result) => {
+      // Timer-driven dispatch (heartbeat timers + routine scheduler) must run on
+      // a single instance per tick so a multi-instance deployment does not fire
+      // redundant wakeups; a losing instance no-ops. This is a de-duplication
+      // layer, not a correctness dependency — the central enqueueWakeup gate
+      // already serializes dispatch. Single-instance deployments always acquire
+      // the lock, so both ticks run exactly as before.
+      void runWithAdvisoryLock(db.$client, ADVISORY_LOCK_KEYS.heartbeatTick, async () => {
+        if (!resolveHeartbeatSchedulingSuppression().suppressed) {
+          try {
+            const result = await heartbeat.tickTimers(new Date());
             if (result.enqueued > 0) {
               logger.info({ ...result }, "heartbeat timer tick enqueued runs");
             }
-          })
-          .catch((err) => {
+          } catch (err) {
             logger.error({ err }, "heartbeat timer tick failed");
-          });
-      }
+          }
+        }
 
-      void routines
-        .tickScheduledTriggers(new Date())
-        .then((result) => {
+        try {
+          const result = await routines.tickScheduledTriggers(new Date());
           if (result.triggered > 0) {
             logger.info({ ...result }, "routine scheduler tick enqueued runs");
           }
-        })
-        .catch((err) => {
+        } catch (err) {
           logger.error({ err }, "routine scheduler tick failed");
-        });
+        }
+      }).catch((err) => {
+        logger.error({ err }, "heartbeat tick advisory-lock guard failed");
+      });
 
       void environmentCustomImages
         .cleanupExpiredSetupSessions()
@@ -954,69 +961,72 @@ export async function startServer(): Promise<StartedServer> {
   
       if (!resolveHeartbeatSchedulingSuppression().suppressed) {
         // Periodically reap orphaned runs (5-min staleness threshold) and make sure
-        // persisted queued work is still being driven forward.
-        void heartbeat
-          .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
-          .then(() => heartbeat.promoteDueScheduledRetries())
-          .then(async (promotion) => {
-            await heartbeat.resumeQueuedRuns();
-            const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-            if (
-              promotion.promoted > 0 ||
-              reconciled.assignmentDispatched > 0 ||
-              reconciled.dispatchRequeued > 0 ||
-              reconciled.continuationRequeued > 0 ||
-              reconciled.successfulRunHandoffEscalated > 0 ||
-              reconciled.escalated > 0
-            ) {
-              logger.warn(
-                { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
-                "periodic heartbeat recovery changed assigned issue state",
-              );
-            }
-          })
-          .then(async () => {
-            const reconciled = await heartbeat.reconcileIssueGraphLiveness();
-            if (reconciled.escalationsCreated > 0 || reconciled.dependencyWakesHealed > 0) {
-              logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
-            }
-          })
-          .then(async () => {
-            const reconciled = await heartbeat.reconcileTaskWatchdogs();
-            if (reconciled.triggered > 0) {
-              logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
-            }
-          })
-          .then(async () => {
-            const scanned = await heartbeat.scanSilentActiveRuns();
-            if (scanned.created > 0 || scanned.escalated > 0) {
-              logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
-            }
-          })
-          .then(async () => {
-            const swept = await heartbeat.sweepStaleIssueLocks();
-            if (swept.cleared > 0) {
-              logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
-            }
-          })
-          .then(async () => {
-            const duplicateSessions = await heartbeat.detectDuplicateActiveIssueSessions();
-            if (duplicateSessions.detected > 0) {
-              logger.warn(
-                { ...duplicateSessions },
-                "periodic duplicate active issue-session detector found violations",
-              );
-            }
-          })
-          .then(async () => {
-            const reviewed = await heartbeat.reconcileProductivityReviews();
-            if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-              logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
-            }
-          })
-          .catch((err) => {
-            logger.error({ err }, "periodic heartbeat recovery failed");
-          });
+        // persisted queued work is still being driven forward. Guarded so a
+        // multi-instance deployment runs the recovery chain on one instance per
+        // tick. Every mutation here is already fencing-guarded, so the lock
+        // removes redundant work rather than being a correctness dependency.
+        void runWithAdvisoryLock(db.$client, ADVISORY_LOCK_KEYS.heartbeatReaper, async () => {
+          await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+          const promotion = await heartbeat.promoteDueScheduledRetries();
+          await heartbeat.resumeQueuedRuns();
+          const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+          if (
+            promotion.promoted > 0 ||
+            reconciled.assignmentDispatched > 0 ||
+            reconciled.dispatchRequeued > 0 ||
+            reconciled.continuationRequeued > 0 ||
+            reconciled.successfulRunHandoffEscalated > 0 ||
+            reconciled.escalated > 0
+          ) {
+            logger.warn(
+              { promotedScheduledRetries: promotion.promoted, promotedScheduledRetryRunIds: promotion.runIds, ...reconciled },
+              "periodic heartbeat recovery changed assigned issue state",
+            );
+          }
+
+          const graphReconciled = await heartbeat.reconcileIssueGraphLiveness();
+          if (graphReconciled.escalationsCreated > 0 || graphReconciled.dependencyWakesHealed > 0) {
+            logger.warn({ ...graphReconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
+          }
+
+          const watchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
+          if (watchdogsReconciled.triggered > 0) {
+            logger.warn({ ...watchdogsReconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
+          }
+
+          const scanned = await heartbeat.scanSilentActiveRuns();
+          if (scanned.created > 0 || scanned.escalated > 0) {
+            logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
+          }
+
+          const swept = await heartbeat.sweepStaleIssueLocks();
+          if (swept.cleared > 0) {
+            logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+          }
+
+          const reviewed = await heartbeat.reconcileProductivityReviews();
+          if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
+            logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
+          }
+        }).catch((err) => {
+          logger.error({ err }, "periodic heartbeat recovery failed");
+        });
+
+        // Duplicate active issue-session detection is observation-only (it logs
+        // violations and mutates nothing) and independent of the recovery chain,
+        // so it carries its own advisory-lock key and runs on any single instance
+        // per tick.
+        void runWithAdvisoryLock(db.$client, ADVISORY_LOCK_KEYS.duplicateSessionDetector, async () => {
+          const duplicateSessions = await heartbeat.detectDuplicateActiveIssueSessions();
+          if (duplicateSessions.detected > 0) {
+            logger.warn(
+              { ...duplicateSessions },
+              "periodic duplicate active issue-session detector found violations",
+            );
+          }
+        }).catch((err) => {
+          logger.error({ err }, "periodic duplicate active issue-session detection failed");
+        });
       }
     }, config.heartbeatSchedulerIntervalMs);
   }
