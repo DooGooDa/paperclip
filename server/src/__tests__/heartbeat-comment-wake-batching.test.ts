@@ -337,6 +337,15 @@ describeEmbeddedPostgres("heartbeat comment wake batching", () => {
       },
       startedAt: new Date(),
     });
+    // Register the run as a live process so it is a genuine active session, not
+    // a zombie. Upstream's coalesce path (filterZombieCoalesceTarget) refuses to
+    // coalesce into a `running` run with no live process — without this the wake
+    // would correctly start a fresh run instead of merging.
+    runningProcesses.set(runId, {
+      child: {} as never,
+      graceSec: 0,
+      processGroupId: null,
+    });
 
     await db.insert(issues).values({
       id: issueId,
