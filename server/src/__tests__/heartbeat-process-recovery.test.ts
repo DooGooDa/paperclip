@@ -932,6 +932,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
+      defaultResponsibleUserId: "responsible-user",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
     });

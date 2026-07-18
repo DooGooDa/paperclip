@@ -3313,20 +3313,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     const recoveryCause = input.recoveryCause ?? "stranded_assigned_issue";
-    // DGG-5493/5210: bounded (dedup + cap) recovery sub-issue creation preserves
-    // the fork governance surface and fires the creation callbacks so reconcile
-    // can count dedup/cap outcomes. Upstream's source-scoped recovery action
-    // (below) still drives blocked-status ownership. Skipped for done/cancelled
-    // sources (DGG-7354).
-    if (input.issue.status !== "done" && input.issue.status !== "cancelled") {
-      await ensureStrandedIssueRecoveryIssue({
-        issue: input.issue,
-        previousStatus: input.previousStatus,
-        latestRun: input.latestRun,
-        onCreationDeduped: input.onRecoveryIssueCreationDeduped,
-        onCreationCapped: input.onRecoveryIssueCreationCapped,
-      });
-    }
+    // upstream-흡수(DGG-5493/5614): the fork's recovery sub-issue mechanism is
+    // superseded by upstream's source-scoped recovery *action* (upsert-deduped by
+    // fingerprint), so escalation no longer spawns stranded_issue_recovery
+    // sub-issues. The `onRecoveryIssueCreation*` callbacks are retained on the
+    // interface for call-site compatibility but no longer fire.
     const recoveryAction = await ensureSourceScopedStrandedRecoveryAction({
       issue: input.issue,
       previousStatus: input.previousStatus,
@@ -5237,7 +5228,6 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const cutoff = new Date(now.getTime() - lookbackHours * 60 * 60 * 1000);
     const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings);
     const doneRecoveryBlockerCleanup = await retireDoneLivenessRecoveryBlockers();
-    const terminalBlockerCleanup = await cleanupTerminalBlockerRelations();
     const updatedAtByIssueKey = await loadLivenessDependencyUpdatedAtByIssue(findings);
     const result = {
       findings: findings.length,
@@ -5264,12 +5254,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       dependencyWakeDeferredOrFailed: 0,
       dependencyWakeEnqueueFailed: 0,
       dependencyWakeIssueIds: [] as string[],
-      terminalBlockerRelationsRemoved: terminalBlockerCleanup.removed,
+      terminalBlockerRelationsRemoved: 0,
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
       retiredRecoveryIssueIds: obsoleteRecoveryCleanup.retiredIssueIds,
     };
-    result.issueIds.push(...terminalBlockerCleanup.issueIds);
 
     if (!autoRecoveryEnabled) {
       result.skippedAutoRecoveryDisabled = findings.length;
@@ -5290,6 +5279,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     result.dependencyWakeDeferredOrFailed = dependencyWakeBackstop.deferredOrFailed;
     result.dependencyWakeEnqueueFailed = dependencyWakeBackstop.enqueueFailed;
     result.dependencyWakeIssueIds = dependencyWakeBackstop.issueIds;
+
+    // DGG fork (#33 f249beec): clean up terminal (done) blocker relations AFTER
+    // the upstream dependency-wake backstop has healed dependents. Running the
+    // cleanup earlier would remove the resolved-blocker relations the backstop
+    // keys on, suppressing the wake (observed as dependencyWakesHealed=0).
+    const terminalBlockerCleanup = await cleanupTerminalBlockerRelations();
+    result.terminalBlockerRelationsRemoved = terminalBlockerCleanup.removed;
+    result.issueIds.push(...terminalBlockerCleanup.issueIds);
 
     for (const finding of findings) {
       if (!isLivenessFindingInsideAutoRecoveryLookback(finding, cutoff, updatedAtByIssueKey)) {

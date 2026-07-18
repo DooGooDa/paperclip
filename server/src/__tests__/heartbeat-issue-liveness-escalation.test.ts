@@ -136,6 +136,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
+      defaultResponsibleUserId: "responsible-user",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
     });
@@ -227,6 +228,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
+      defaultResponsibleUserId: "responsible-user",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
     });
@@ -905,6 +907,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     await db.insert(companies).values({
       id: companyId,
       name: "Paperclip",
+      defaultResponsibleUserId: "responsible-user",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
     });
