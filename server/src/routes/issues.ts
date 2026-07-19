@@ -86,12 +86,15 @@ import {
   type SourceTrustMetadata,
   type SuccessfulRunHandoffState,
   type WorkspaceRuntimeService,
+  buildRetryContext,
+  type RetryContext,
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import type { StorageService } from "../storage/types.js";
 import { validate } from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
+import { getIssueFailureRecord } from "../services/issue-failure-record.js";
 import {
   accessService,
   agentService,
@@ -349,6 +352,7 @@ type ExecutionStageWakeContext = {
   reviewRequest: ParsedExecutionState["reviewRequest"];
   lastDecisionOutcome: ParsedExecutionState["lastDecisionOutcome"];
   allowedActions: string[];
+  retryContext?: RetryContext;
 };
 type SuccessfulRunHandoffActivityRow = {
   entityId: string;
@@ -1638,6 +1642,7 @@ function buildExecutionStageWakeContext(input: {
   state: ParsedExecutionState;
   wakeRole: ExecutionStageWakeContext["wakeRole"];
   allowedActions: string[];
+  retryContext?: RetryContext;
 }): ExecutionStageWakeContext {
   return {
     wakeRole: input.wakeRole,
@@ -1648,6 +1653,7 @@ function buildExecutionStageWakeContext(input: {
     reviewRequest: input.state.reviewRequest ?? null,
     lastDecisionOutcome: input.state.lastDecisionOutcome,
     allowedActions: input.allowedActions,
+    ...(input.retryContext ? { retryContext: input.retryContext } : {}),
   };
 }
 
@@ -1988,6 +1994,38 @@ function diffExecutionParticipants(
   };
 }
 
+async function resolveExecutorRetryContext(
+  db: Db,
+  issueId: string,
+  nextState: ParsedExecutionState | null,
+  interruptedRunId: string | null,
+): Promise<RetryContext | undefined> {
+  // Retry memory is only for an executor re-dispatch (a reviewer sent the work
+  // back). First assignment and review/approval wakes carry no retryContext, so
+  // a non-changes_requested state short-circuits before any DB read.
+  if (nextState?.status !== "changes_requested") return undefined;
+  try {
+    const record = await getIssueFailureRecord(db, issueId);
+    // buildRetryContext returns undefined when attemptCount <= 0, so the very
+    // first dispatch (no prior execution_changes_requested wake) injects nothing.
+    return buildRetryContext({
+      attemptCount: record.attemptCount,
+      failureClass: record.failureClass,
+      lastError: record.lastError,
+      retryOfRunId: interruptedRunId,
+    });
+  } catch (err) {
+    // Retry memory is best-effort context layered onto the re-dispatch wake. If
+    // the failure-record lookup fails, still fire the wake (without retryContext)
+    // rather than failing the whole stage transition.
+    logger.warn(
+      { err, issueId },
+      "failed to resolve executor retry context; dispatching without retry memory",
+    );
+    return undefined;
+  }
+}
+
 function buildExecutionStageWakeup(input: {
   issueId: string;
   previousState: ParsedExecutionState | null;
@@ -1995,6 +2033,7 @@ function buildExecutionStageWakeup(input: {
   interruptedRunId: string | null;
   requestedByActorType: "user" | "agent";
   requestedByActorId: string;
+  retryContext?: RetryContext;
 }) {
   const { issueId, previousState, nextState, interruptedRunId } = input;
   if (!nextState) return null;
@@ -2054,6 +2093,7 @@ function buildExecutionStageWakeup(input: {
       state: nextState,
       wakeRole: "executor",
       allowedActions: ["address_changes", "resubmit"],
+      retryContext: input.retryContext,
     });
 
     return {
@@ -8147,6 +8187,12 @@ export function issueRoutes(
       req.body.status !== undefined;
     const previousExecutionState = parseIssueExecutionState(existing.executionState);
     const nextExecutionState = parseIssueExecutionState(issue.executionState);
+    const executorRetryContext = await resolveExecutorRetryContext(
+      db,
+      issue.id,
+      nextExecutionState,
+      interruptedRunId,
+    );
     const executionStageWakeup = buildExecutionStageWakeup({
       issueId: issue.id,
       previousState: previousExecutionState,
@@ -8154,6 +8200,7 @@ export function issueRoutes(
       interruptedRunId,
       requestedByActorType: actor.actorType,
       requestedByActorId: actor.actorId,
+      retryContext: executorRetryContext,
     });
 
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
@@ -9674,13 +9721,21 @@ export function issueRoutes(
           },
         });
       }
+      const commentDecisionNextState = parseIssueExecutionState(currentIssue.executionState);
+      const commentDecisionRetryContext = await resolveExecutorRetryContext(
+        db,
+        currentIssue.id,
+        commentDecisionNextState,
+        interruptedRunId,
+      );
       commentDecisionStageWakeup = buildExecutionStageWakeup({
         issueId: currentIssue.id,
         previousState: currentExecutionState,
-        nextState: parseIssueExecutionState(currentIssue.executionState),
+        nextState: commentDecisionNextState,
         interruptedRunId,
         requestedByActorType: actor.actorType,
         requestedByActorId: actor.actorId,
+        retryContext: commentDecisionRetryContext,
       });
     } else {
       comment = await svc.addComment(id, req.body.body, {

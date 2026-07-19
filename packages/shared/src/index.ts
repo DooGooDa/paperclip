@@ -1696,3 +1696,15 @@ export type {
   FailureClassificationContext,
   WakeReasonRow,
 } from "./failure-classification.js";
+export {
+  RETRY_CONTEXT_LAST_ERROR_MAX_LENGTH,
+  buildRetryContext,
+  retryContextStamp,
+  retryGuidanceForFailureClass,
+  shouldInjectRetryContext,
+  truncateRetryError,
+} from "./retry-context.js";
+export type {
+  RetryContext,
+  RetryContextInput,
+} from "./retry-context.js";
