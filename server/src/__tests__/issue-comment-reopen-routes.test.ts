@@ -7,6 +7,7 @@ const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   update: vi.fn(),
   addComment: vi.fn(),
+  listComments: vi.fn(),
   getDependencyReadiness: vi.fn(),
   getCurrentScheduledRetry: vi.fn(),
   findMentionedAgents: vi.fn(),
@@ -237,6 +238,7 @@ describe.sequential("issue comment reopen routes", () => {
     mockIssueService.assertCheckoutOwner.mockReset();
     mockIssueService.update.mockReset();
     mockIssueService.addComment.mockReset();
+    mockIssueService.listComments.mockReset();
     mockIssueService.getDependencyReadiness.mockReset();
     mockIssueService.getCurrentScheduledRetry.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
@@ -317,6 +319,12 @@ describe.sequential("issue comment reopen routes", () => {
       authorUserId: "local-board",
     });
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
+    // E6 done evidence gate (T6.3): default the issue's prior comments to RICH evidence
+    // (PR merge + test result) so auto-approval mechanics under test are not blocked by
+    // the evidence gate. Cases exercising the gate itself override this per-test.
+    mockIssueService.listComments.mockResolvedValue([
+      { body: "Evidence: merged PR #123, tests 12/12 pass" },
+    ]);
     mockIssueService.getDependencyReadiness.mockResolvedValue({
       issueId: "11111111-1111-4111-8111-111111111111",
       blockerIssueIds: [],
