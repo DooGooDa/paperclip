@@ -1685,3 +1685,14 @@ export {
   type CreateEnvironmentCustomImageTerminalSessionToken,
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
+export {
+  EXECUTION_CHANGES_REQUESTED_WAKE_REASON,
+  classifyFailure,
+  countExecutionChangesRequestedWakes,
+  wakeReasonCountsAsExecutionAttempt,
+} from "./failure-classification.js";
+export type {
+  FailureClass,
+  FailureClassificationContext,
+  WakeReasonRow,
+} from "./failure-classification.js";
