@@ -367,7 +367,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       return {
         id: stage.id ?? randomUUID(),
         type: stage.type,
-        approvalsNeeded: 1 as const,
+        approvalsNeeded: stage.approvalsNeeded,
         participants: dedupedParticipants,
       };
     })
