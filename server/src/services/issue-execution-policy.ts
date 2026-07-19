@@ -432,6 +432,19 @@ function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecuti
   return a.type === "agent" ? a.agentId === b.agentId : a.userId === b.userId;
 }
 
+function appendApprover(
+  approvers: IssueExecutionStagePrincipal[],
+  approver: IssueExecutionStagePrincipal,
+  executor: IssueExecutionStagePrincipal | null,
+): IssueExecutionStagePrincipal[] {
+  if (executor && principalsEqual(approver, executor)) return approvers;
+  if (approvers.some((existing) => principalsEqual(existing, approver))) return approvers;
+  return [
+    ...approvers,
+    { type: approver.type, agentId: approver.agentId ?? null, userId: approver.userId ?? null },
+  ];
+}
+
 function findStageById(policy: IssueExecutionPolicy, stageId: string | null | undefined) {
   if (!stageId) return null;
   return policy.stages.find((stage) => stage.id === stageId) ?? null;
@@ -712,6 +725,44 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         if (!input.commentBody?.trim()) {
           throw unprocessable("Approving a review or approval stage requires a comment");
         }
+
+        const approvers = appendApprover(
+          existingState?.currentStageApprovers ?? [],
+          currentParticipant,
+          existingState?.returnAssignee ?? null,
+        );
+        if (approvers.length < activeStage.approvalsNeeded) {
+          const nextApprover = selectStageParticipant(activeStage, {
+            preferred: explicitAssignee,
+            exclude: [existingState?.returnAssignee ?? null, ...approvers],
+          });
+          if (nextApprover) {
+            buildPendingStagePatch({
+              patch,
+              previous: existingState,
+              policy: input.policy,
+              stage: activeStage,
+              participant: nextApprover,
+              returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+              reviewRequest: effectiveReviewRequest,
+              approvers,
+            });
+            return {
+              patch,
+              decision: {
+                stageId: activeStage.id,
+                stageType: activeStage.type,
+                outcome: "approved",
+                body: input.commentBody.trim(),
+              },
+              workflowControlledAssignment: true,
+            };
+          }
+          // Every eligible (non-executor) participant has approved but the configured
+          // quorum still isn't met — the executor is in the participant list, shrinking
+          // the eligible pool. Complete rather than strand the stage in a deadlock.
+        }
+
         const approvedState = buildCompletedState(existingState, activeStage);
         const nextStage = nextPendingStage(
           input.policy,
