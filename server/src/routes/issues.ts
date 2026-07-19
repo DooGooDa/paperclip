@@ -86,8 +86,11 @@ import {
   type SourceTrustMetadata,
   type SuccessfulRunHandoffState,
   type WorkspaceRuntimeService,
+  MAX_RETRY_ATTEMPTS,
   buildRetryContext,
+  classifyRetryDisposition,
   type RetryContext,
+  type FailureClass,
 } from "@paperclipai/shared";
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
@@ -1994,35 +1997,116 @@ function diffExecutionParticipants(
   };
 }
 
-async function resolveExecutorRetryContext(
+type ExecutorRetryDecision =
+  | { kind: "none" }
+  | { kind: "retry"; retryContext: RetryContext }
+  | {
+      kind: "exhausted";
+      attemptCount: number;
+      failureClass: FailureClass;
+      lastError: string | null;
+    };
+
+async function resolveExecutorRetryDecision(
   db: Db,
   issueId: string,
   nextState: ParsedExecutionState | null,
   interruptedRunId: string | null,
-): Promise<RetryContext | undefined> {
-  // Retry memory is only for an executor re-dispatch (a reviewer sent the work
-  // back). First assignment and review/approval wakes carry no retryContext, so
-  // a non-changes_requested state short-circuits before any DB read.
-  if (nextState?.status !== "changes_requested") return undefined;
+  maxRetryAttempts: number,
+): Promise<ExecutorRetryDecision> {
+  // Retry memory / exhaustion applies only to an executor re-dispatch (a reviewer
+  // sent the work back). First assignment and review/approval wakes carry no
+  // retryContext, so a non-changes_requested state short-circuits before any DB read.
+  if (nextState?.status !== "changes_requested") return { kind: "none" };
   try {
     const record = await getIssueFailureRecord(db, issueId);
-    // buildRetryContext returns undefined when attemptCount <= 0, so the very
-    // first dispatch (no prior execution_changes_requested wake) injects nothing.
-    return buildRetryContext({
+    // classifyRetryDisposition gates on attemptCount: <=0 => no prior attempt
+    // (first dispatch injects nothing), >=maxRetryAttempts => exhausted (escalate
+    // instead of re-dispatch), otherwise retry with memory.
+    const disposition = classifyRetryDisposition(record.attemptCount, maxRetryAttempts);
+    if (disposition === "exhausted") {
+      return {
+        kind: "exhausted",
+        attemptCount: record.attemptCount,
+        failureClass: record.failureClass,
+        lastError: record.lastError,
+      };
+    }
+    if (disposition === "no_prior_attempt") return { kind: "none" };
+    const retryContext = buildRetryContext({
       attemptCount: record.attemptCount,
       failureClass: record.failureClass,
       lastError: record.lastError,
       retryOfRunId: interruptedRunId,
     });
+    return retryContext ? { kind: "retry", retryContext } : { kind: "none" };
   } catch (err) {
-    // Retry memory is best-effort context layered onto the re-dispatch wake. If
-    // the failure-record lookup fails, still fire the wake (without retryContext)
-    // rather than failing the whole stage transition.
+    // Best-effort: a failure-record lookup failure degrades to a normal
+    // re-dispatch (no retry memory, no escalation) rather than failing the whole
+    // stage transition.
     logger.warn(
       { err, issueId },
-      "failed to resolve executor retry context; dispatching without retry memory",
+      "failed to resolve executor retry decision; dispatching without retry memory",
     );
-    return undefined;
+    return { kind: "none" };
+  }
+}
+
+async function escalateDispatchRetryExhausted(
+  db: Db,
+  input: {
+    issueId: string;
+    companyId: string;
+    identifier: string | null;
+    actorType: "user" | "agent";
+    actorId: string;
+    agentId: string | null;
+    runId: string | null;
+    attemptCount: number;
+    failureClass: FailureClass;
+    lastError: string | null;
+    maxRetryAttempts: number;
+  },
+): Promise<void> {
+  // Retry-axis exhaustion escalation — mirrors the monitor axis escalate_to_board
+  // shape (issue.monitor_escalated_to_board): post a board comment so a human sees
+  // the halt, then record the activity action. issue.dispatch_retry_exhausted is an
+  // activity_log action (NOT an issue status enum) and is a distinct name from
+  // the C2 self-comment retry marker (a different subsystem). Best-effort: an
+  // escalation write must not fail the stage transition that triggered it.
+  try {
+    await db.insert(issueComments).values({
+      companyId: input.companyId,
+      issueId: input.issueId,
+      body:
+        `Automatic re-dispatch halted: this issue reached the retry limit ` +
+        `(${input.attemptCount}/${input.maxRetryAttempts} execution attempts). ` +
+        `The most recent failure was classified as "${input.failureClass}". ` +
+        `Escalating to the board for a human decision instead of retrying again.`,
+    });
+    await logActivity(db, {
+      companyId: input.companyId,
+      actorType: input.actorType,
+      actorId: input.actorId,
+      agentId: input.agentId,
+      runId: input.runId,
+      action: "issue.dispatch_retry_exhausted",
+      entityType: "issue",
+      entityId: input.issueId,
+      details: {
+        reason: "max_retry_attempts_exhausted",
+        attemptCount: input.attemptCount,
+        maxRetryAttempts: input.maxRetryAttempts,
+        failureClass: input.failureClass,
+        ...(input.lastError ? { lastError: input.lastError } : {}),
+        ...(input.identifier ? { identifier: input.identifier } : {}),
+      },
+    });
+  } catch (err) {
+    logger.warn(
+      { err, issueId: input.issueId },
+      "failed to escalate dispatch retry exhaustion; re-dispatch halted without board escalation",
+    );
   }
 }
 
@@ -8187,21 +8271,41 @@ export function issueRoutes(
       req.body.status !== undefined;
     const previousExecutionState = parseIssueExecutionState(existing.executionState);
     const nextExecutionState = parseIssueExecutionState(issue.executionState);
-    const executorRetryContext = await resolveExecutorRetryContext(
+    const executorRetryDecision = await resolveExecutorRetryDecision(
       db,
       issue.id,
       nextExecutionState,
       interruptedRunId,
+      MAX_RETRY_ATTEMPTS,
     );
-    const executionStageWakeup = buildExecutionStageWakeup({
-      issueId: issue.id,
-      previousState: previousExecutionState,
-      nextState: nextExecutionState,
-      interruptedRunId,
-      requestedByActorType: actor.actorType,
-      requestedByActorId: actor.actorId,
-      retryContext: executorRetryContext,
-    });
+    if (executorRetryDecision.kind === "exhausted") {
+      await escalateDispatchRetryExhausted(db, {
+        issueId: issue.id,
+        companyId: issue.companyId,
+        identifier: issue.identifier,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        attemptCount: executorRetryDecision.attemptCount,
+        failureClass: executorRetryDecision.failureClass,
+        lastError: executorRetryDecision.lastError,
+        maxRetryAttempts: MAX_RETRY_ATTEMPTS,
+      });
+    }
+    const executionStageWakeup =
+      executorRetryDecision.kind === "exhausted"
+        ? null
+        : buildExecutionStageWakeup({
+            issueId: issue.id,
+            previousState: previousExecutionState,
+            nextState: nextExecutionState,
+            interruptedRunId,
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            retryContext:
+              executorRetryDecision.kind === "retry" ? executorRetryDecision.retryContext : undefined,
+          });
 
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
     void (async () => {
@@ -9722,21 +9826,43 @@ export function issueRoutes(
         });
       }
       const commentDecisionNextState = parseIssueExecutionState(currentIssue.executionState);
-      const commentDecisionRetryContext = await resolveExecutorRetryContext(
+      const commentDecisionRetryDecision = await resolveExecutorRetryDecision(
         db,
         currentIssue.id,
         commentDecisionNextState,
         interruptedRunId,
+        MAX_RETRY_ATTEMPTS,
       );
-      commentDecisionStageWakeup = buildExecutionStageWakeup({
-        issueId: currentIssue.id,
-        previousState: currentExecutionState,
-        nextState: commentDecisionNextState,
-        interruptedRunId,
-        requestedByActorType: actor.actorType,
-        requestedByActorId: actor.actorId,
-        retryContext: commentDecisionRetryContext,
-      });
+      if (commentDecisionRetryDecision.kind === "exhausted") {
+        await escalateDispatchRetryExhausted(db, {
+          issueId: currentIssue.id,
+          companyId: currentIssue.companyId,
+          identifier: currentIssue.identifier,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          attemptCount: commentDecisionRetryDecision.attemptCount,
+          failureClass: commentDecisionRetryDecision.failureClass,
+          lastError: commentDecisionRetryDecision.lastError,
+          maxRetryAttempts: MAX_RETRY_ATTEMPTS,
+        });
+      }
+      commentDecisionStageWakeup =
+        commentDecisionRetryDecision.kind === "exhausted"
+          ? null
+          : buildExecutionStageWakeup({
+              issueId: currentIssue.id,
+              previousState: currentExecutionState,
+              nextState: commentDecisionNextState,
+              interruptedRunId,
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              retryContext:
+                commentDecisionRetryDecision.kind === "retry"
+                  ? commentDecisionRetryDecision.retryContext
+                  : undefined,
+            });
     } else {
       comment = await svc.addComment(id, req.body.body, {
         agentId: actor.agentId ?? undefined,

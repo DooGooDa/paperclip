@@ -170,6 +170,41 @@ export function buildRetryContext(input: RetryContextInput): RetryContext | unde
 }
 
 /**
+ * Disposition of an executor re-dispatch decision on the retry axis (E10 T10.6).
+ * Given how many execution_changes_requested attempts an issue already had, decide
+ * whether a fresh dispatch carries no retry memory ("no_prior_attempt" — first
+ * dispatch injects nothing), should be re-dispatched WITH retry memory ("retry"),
+ * or has spent its budget and must escalate instead of re-waking ("exhausted").
+ */
+export type RetryDisposition = "no_prior_attempt" | "retry" | "exhausted";
+
+/**
+ * Max execution_changes_requested re-dispatch attempts before the retry axis
+ * gives up and escalates to the board (E10 T10.6) instead of re-waking. Lives
+ * here (with the retry-axis pure logic) rather than in heartbeat.ts so the route
+ * consumer (issues.ts) can import it without pulling the heartbeat service module
+ * — a route -> heartbeat import triggers a circular-init that 500s the issue
+ * routes. Passed into classifyRetryDisposition as maxAttempts.
+ */
+export const MAX_RETRY_ATTEMPTS = 3;
+
+/**
+ * Pure retry-axis gate (no DB). The attemptCount>0 lower bound mirrors
+ * buildRetryContext (a first dispatch injects nothing); the attemptCount>=maxAttempts
+ * upper bound is the T10.6 escalation trigger. The server (issues.ts) resolves
+ * attemptCount from the failure record, applies this gate, and either builds the
+ * re-dispatch wake or fires the dispatch_retry_exhausted board escalation.
+ */
+export function classifyRetryDisposition(
+  attemptCount: number,
+  maxAttempts: number,
+): RetryDisposition {
+  if (!(attemptCount > 0)) return "no_prior_attempt";
+  if (attemptCount >= maxAttempts) return "exhausted";
+  return "retry";
+}
+
+/**
  * Idempotency stamp for a retry injection. Equal stamps => the same attempt's
  * memory => a redelivered wake must not re-inject it. A genuinely newer attempt
  * (new run or higher attemptCount) => a distinct stamp.

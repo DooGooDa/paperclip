@@ -1701,7 +1701,9 @@ export {
   REFLECTION_INSTRUCTION_PREFIX,
   RETRY_CONTEXT_LAST_ERROR_MAX_LENGTH,
   buildReflectionInstruction,
+  MAX_RETRY_ATTEMPTS,
   buildRetryContext,
+  classifyRetryDisposition,
   firstCommentSignalsReflection,
   retryContextStamp,
   retryGuidanceForFailureClass,
@@ -1711,4 +1713,5 @@ export {
 export type {
   RetryContext,
   RetryContextInput,
+  RetryDisposition,
 } from "./retry-context.js";

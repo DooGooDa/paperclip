@@ -6,6 +6,7 @@ import {
   RETRY_CONTEXT_LAST_ERROR_MAX_LENGTH,
   buildReflectionInstruction,
   buildRetryContext,
+  classifyRetryDisposition,
   firstCommentSignalsReflection,
   retryContextStamp,
   retryGuidanceForFailureClass,
@@ -212,5 +213,30 @@ describe("firstCommentSignalsReflection — T10.4 compliance query stub (observa
   it("markers are declared as named constants (no inline magic strings)", () => {
     expect(REFLECTION_COMPLIANCE_MARKERS.length).toBeGreaterThan(0);
     expect(REFLECTION_COMPLIANCE_MARKERS).toContain("differently");
+  });
+});
+
+describe("classifyRetryDisposition — retry axis exhaustion gate (E10 T10.6)", () => {
+  it("attemptCount = 0 => no prior attempt (first dispatch injects nothing)", () => {
+    expect(classifyRetryDisposition(0, 3)).toBe("no_prior_attempt");
+  });
+
+  it("attemptCount below the limit => retry (re-dispatch with memory)", () => {
+    expect(classifyRetryDisposition(1, 3)).toBe("retry");
+    expect(classifyRetryDisposition(2, 3)).toBe("retry");
+  });
+
+  it("attemptCount at the limit => exhausted (escalate instead of re-dispatch)", () => {
+    expect(classifyRetryDisposition(3, 3)).toBe("exhausted");
+  });
+
+  it("attemptCount over the limit => exhausted", () => {
+    expect(classifyRetryDisposition(4, 3)).toBe("exhausted");
+    expect(classifyRetryDisposition(10, 3)).toBe("exhausted");
+  });
+
+  it("boundary is inclusive at maxAttempts and honors a custom limit", () => {
+    expect(classifyRetryDisposition(4, 5)).toBe("retry");
+    expect(classifyRetryDisposition(5, 5)).toBe("exhausted");
   });
 });
