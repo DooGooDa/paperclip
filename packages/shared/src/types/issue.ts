@@ -595,7 +595,7 @@ export interface IssueExecutionStageParticipant extends IssueExecutionStagePrinc
 export interface IssueExecutionStage {
   id: string;
   type: IssueExecutionStageType;
-  approvalsNeeded: 1;
+  approvalsNeeded: number;
   participants: IssueExecutionStageParticipant[];
 }
 

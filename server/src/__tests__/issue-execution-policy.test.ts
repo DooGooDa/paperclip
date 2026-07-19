@@ -95,14 +95,34 @@ describe("normalizeIssueExecutionPolicy", () => {
     expect(result!.mode).toBe("normal");
   });
 
-  it("rejects approvalsNeeded values above 1", () => {
+  it("accepts approvalsNeeded within the participant count", () => {
+    const result = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          type: "review",
+          approvalsNeeded: 2,
+          participants: [
+            { type: "agent", agentId: qaAgentId },
+            { type: "agent", agentId: coderAgentId },
+          ],
+        },
+      ],
+    });
+    expect(result!.stages).toHaveLength(1);
+    expect(result!.stages[0].participants).toHaveLength(2);
+  });
+
+  it("rejects approvalsNeeded exceeding the participant count", () => {
     expect(() =>
       normalizeIssueExecutionPolicy({
         stages: [
           {
             type: "review",
-            approvalsNeeded: 2,
-            participants: [{ type: "agent", agentId: qaAgentId }],
+            approvalsNeeded: 3,
+            participants: [
+              { type: "agent", agentId: qaAgentId },
+              { type: "agent", agentId: coderAgentId },
+            ],
           },
         ],
       }),
