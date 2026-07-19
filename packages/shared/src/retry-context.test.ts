@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { FailureClass } from "./failure-classification.js";
 import {
+  REFLECTION_COMPLIANCE_MARKERS,
+  REFLECTION_INSTRUCTION_PREFIX,
   RETRY_CONTEXT_LAST_ERROR_MAX_LENGTH,
+  buildReflectionInstruction,
   buildRetryContext,
+  firstCommentSignalsReflection,
   retryContextStamp,
   retryGuidanceForFailureClass,
   shouldInjectRetryContext,
@@ -115,5 +119,98 @@ describe("retry idempotency — stamp blocks re-injecting the same attempt", () 
     const s = retryContextStamp({ attemptCount: 1, retryOfRunId: null });
     expect(s).toBe(retryContextStamp({ attemptCount: 1, retryOfRunId: null }));
     expect(s).not.toBe(retryContextStamp({ attemptCount: 2, retryOfRunId: null }));
+  });
+});
+
+describe("buildReflectionInstruction — prefix + class-specific recovery guidance", () => {
+  it("always starts with the Reflection-Before-Retry prefix (the 'do differently' directive)", () => {
+    for (const cls of ["verify", "ci", "review", "runtime", "tool", "unknown"] as FailureClass[]) {
+      expect(buildReflectionInstruction(cls).startsWith(REFLECTION_INSTRUCTION_PREFIX)).toBe(true);
+    }
+  });
+
+  it("combines the class-specific guidance so verify => verify guidance, review => review guidance", () => {
+    const verify = buildReflectionInstruction("verify");
+    const review = buildReflectionInstruction("review");
+    // Each class's instruction embeds that class's own recovery guidance (deterministic per class).
+    expect(verify).toContain(retryGuidanceForFailureClass("verify")!);
+    expect(review).toContain(retryGuidanceForFailureClass("review")!);
+    // ...and not the other class's guidance (the mapping is class-specific, not shared).
+    expect(verify).not.toContain(retryGuidanceForFailureClass("review")!);
+    expect(review).not.toContain(retryGuidanceForFailureClass("verify")!);
+  });
+
+  it("ci / runtime / tool each embed their own class guidance", () => {
+    for (const cls of ["ci", "runtime", "tool"] as FailureClass[]) {
+      expect(buildReflectionInstruction(cls)).toContain(retryGuidanceForFailureClass(cls)!);
+    }
+  });
+
+  it("unknown class (no specific guidance) => the prefix stands alone (still non-empty)", () => {
+    expect(buildReflectionInstruction("unknown")).toBe(REFLECTION_INSTRUCTION_PREFIX);
+    expect(buildReflectionInstruction("unknown").length).toBeGreaterThan(0);
+  });
+});
+
+describe("buildRetryContext — reflection instruction rides the same wake context", () => {
+  it("attemptCount > 0 => reflectionInstruction is present and class-specific", () => {
+    const ctx = buildRetryContext({
+      attemptCount: 2,
+      failureClass: "verify",
+      lastError: "verification failed: evidence missing for AC 2",
+      retryOfRunId: "run-abc",
+    });
+    expect(ctx?.reflectionInstruction).toBeTruthy();
+    expect(ctx?.reflectionInstruction).toBe(buildReflectionInstruction("verify"));
+  });
+
+  it("failure summary (what failed) + reflection instruction (what's different) share one payload", () => {
+    // AC: T10.2 injection summary and the T10.3 reflection directive arrive in the
+    // same wake context — proven by both living on the single returned RetryContext.
+    const ctx = buildRetryContext({
+      attemptCount: 1,
+      failureClass: "review",
+      lastError: "reviewer requested changes: rename the field",
+      retryOfRunId: "run-r",
+    });
+    expect(ctx).toBeDefined();
+    expect(ctx?.lastError).toContain("reviewer requested changes"); // what failed (T10.2)
+    expect(ctx?.guidance).toBeTruthy(); // remediation hint (T10.2)
+    expect(ctx?.reflectionInstruction).toContain(REFLECTION_INSTRUCTION_PREFIX); // what's different (T10.3)
+  });
+
+  it("first dispatch (attemptCount = 0) => no RetryContext, so no reflection instruction injected", () => {
+    const ctx = buildRetryContext({
+      attemptCount: 0,
+      failureClass: "verify",
+      lastError: "should never appear on a first dispatch",
+    });
+    expect(ctx).toBeUndefined();
+    expect(ctx?.reflectionInstruction).toBeUndefined();
+  });
+});
+
+describe("firstCommentSignalsReflection — T10.4 compliance query stub (observation axis)", () => {
+  it("detects a first comment that states a change of approach", () => {
+    expect(
+      firstCommentSignalsReflection("This time I will run the tests differently and quote the output."),
+    ).toBe(true);
+    expect(firstCommentSignalsReflection("이전과 다르게 타입 가드를 먼저 추가한다")).toBe(true);
+    expect(firstCommentSignalsReflection("Instead of re-running the same build, I fix the import.")).toBe(true);
+  });
+
+  it("returns false for a comment that just repeats the work with no reflection", () => {
+    expect(firstCommentSignalsReflection("Working on the issue now.")).toBe(false);
+  });
+
+  it("null / empty => not compliant", () => {
+    expect(firstCommentSignalsReflection(null)).toBe(false);
+    expect(firstCommentSignalsReflection(undefined)).toBe(false);
+    expect(firstCommentSignalsReflection("")).toBe(false);
+  });
+
+  it("markers are declared as named constants (no inline magic strings)", () => {
+    expect(REFLECTION_COMPLIANCE_MARKERS.length).toBeGreaterThan(0);
+    expect(REFLECTION_COMPLIANCE_MARKERS).toContain("differently");
   });
 });

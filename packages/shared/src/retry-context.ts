@@ -38,6 +38,15 @@ export interface RetryContext {
    * not re-inject the same attempt's memory. Null when the run is unknown.
    */
   retryOfRunId: string | null;
+  /**
+   * Reflection-Before-Retry directive (T10.3) — asks the re-dispatched executor
+   * to state, in its first comment, what it will do differently from the prior
+   * approach, combined with the class-specific recovery guidance. Present
+   * whenever this RetryContext is (attemptCount > 0); absent on a first dispatch
+   * (no RetryContext at all). Instruction text only, NOT an enforced gate —
+   * enforcing "state what's different" as a done-gate is E6's territory.
+   */
+  reflectionInstruction?: string;
 }
 
 /** Inputs needed to shape a RetryContext — a subset of IssueFailureRecord. */
@@ -63,6 +72,68 @@ const GUIDANCE_BY_FAILURE_CLASS: Record<FailureClass, string | null> = {
 /** Class-specific remediation hint. Null-safe: unknown / unrecognised => null. */
 export function retryGuidanceForFailureClass(failureClass: FailureClass): string | null {
   return GUIDANCE_BY_FAILURE_CLASS[failureClass] ?? null;
+}
+
+/**
+ * Reflection-Before-Retry directive prefix — ported from the grind loop's
+ * reflect()/error-classifier RECOVERY_GUIDES convention. The re-dispatched
+ * executor reads this on a retry wake and is asked to state, in its first
+ * comment, what it will do differently from the failed approach. This is
+ * instruction text only — NOT an enforced gate. Enforcing compliance as a
+ * done-gate is E6's territory; E10 wires the instruction and defines the
+ * observation axis (T10.4 measures compliance).
+ *
+ * Named const (no inline magic string) so the injected literal is greppable and
+ * the T10.4 compliance query can reference the exact injected text.
+ */
+export const REFLECTION_INSTRUCTION_PREFIX =
+  "This is a retry: a prior attempt on this issue already failed. Before touching the work, post a first comment that states explicitly what you will do differently from the previous approach — do not silently repeat the steps that failed.";
+
+/**
+ * Compose the reflection instruction for a retry wake: the Reflection-Before-Retry
+ * prefix combined with the class-specific recovery guidance. The recovery guidance
+ * is the grind RECOVERY_GUIDES analog — GUIDANCE_BY_FAILURE_CLASS (T10.1/T10.2),
+ * reused rather than duplicated. Always a non-empty string; when a class carries
+ * no specific guidance (unknown) the prefix stands alone.
+ */
+export function buildReflectionInstruction(failureClass: FailureClass): string {
+  const recovery = retryGuidanceForFailureClass(failureClass);
+  return recovery
+    ? `${REFLECTION_INSTRUCTION_PREFIX} ${recovery}`
+    : REFLECTION_INSTRUCTION_PREFIX;
+}
+
+/**
+ * Observation-axis handoff to T10.4 (E10 scope = instruction wiring + axis
+ * definition; the A/B measurement is T10.4). Reflection compliance is measured
+ * by whether a retry issue's first executor comment states what is being done
+ * differently. These heuristic markers are the seam T10.4's activity_log query
+ * keys off — NOT an enforced gate.
+ */
+export const REFLECTION_COMPLIANCE_MARKERS: readonly string[] = [
+  "differently",
+  "different approach",
+  "instead of",
+  "prior approach",
+  "previous approach",
+  "previous attempt",
+  "last attempt",
+  "다르게",
+  "이전과",
+  "이전 접근",
+  "대신",
+];
+
+/**
+ * Pure query stub for T10.4: true when a retry's first comment appears to
+ * acknowledge a change of approach (reflection compliance). The T10.4 metrics
+ * script applies this per first comment to compute a compliance rate. Heuristic
+ * over REFLECTION_COMPLIANCE_MARKERS; null/empty => not compliant.
+ */
+export function firstCommentSignalsReflection(commentText: string | null | undefined): boolean {
+  if (commentText == null) return false;
+  const lower = commentText.toLowerCase();
+  return REFLECTION_COMPLIANCE_MARKERS.some((marker) => lower.includes(marker.toLowerCase()));
 }
 
 /**
@@ -94,6 +165,7 @@ export function buildRetryContext(input: RetryContextInput): RetryContext | unde
     lastError: truncateRetryError(input.lastError),
     guidance: retryGuidanceForFailureClass(input.failureClass),
     retryOfRunId: input.retryOfRunId ?? null,
+    reflectionInstruction: buildReflectionInstruction(input.failureClass),
   };
 }
 

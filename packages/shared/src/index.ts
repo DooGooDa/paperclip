@@ -1697,8 +1697,12 @@ export type {
   WakeReasonRow,
 } from "./failure-classification.js";
 export {
+  REFLECTION_COMPLIANCE_MARKERS,
+  REFLECTION_INSTRUCTION_PREFIX,
   RETRY_CONTEXT_LAST_ERROR_MAX_LENGTH,
+  buildReflectionInstruction,
   buildRetryContext,
+  firstCommentSignalsReflection,
   retryContextStamp,
   retryGuidanceForFailureClass,
   shouldInjectRetryContext,
