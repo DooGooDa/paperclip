@@ -95,6 +95,7 @@ import {
   type RunLivenessClassificationInput,
 } from "./run-liveness.js";
 import { logActivity, publishPluginDomainEvent, type LogActivityInput } from "./activity-log.js";
+import { logDoneGateBypass } from "./issue-done-gate-audit.js";
 import {
   buildWorkspaceReadyComment,
   cleanupExecutionWorkspaceArtifacts,
@@ -13071,6 +13072,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .update(issues)
           .set({ status: finalStatus, updatedAt: new Date() })
           .where(and(eq(issues.id, issue.id), eq(issues.assigneeAgentId, run.agentId)));
+        if (finalStatus === "done") {
+          await logDoneGateBypass(db, {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            previousStatus: issue.status,
+            reason: "heartbeat.routine_execution_run_finalized",
+            agentId: run.agentId,
+            runId: run.id,
+            originKind: issue.originKind,
+          });
+        }
         return { kind: "released" as const };
       }
 

@@ -34,6 +34,7 @@ import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local
 import { redactCurrentUserText } from "../../log-redaction.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { logActivity } from "../activity-log.js";
+import { logDoneGateBypass } from "../issue-done-gate-audit.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -1656,6 +1657,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     if (input.existingEvaluation && !isTerminalIssueStatus(input.existingEvaluation.status)) {
       await issuesSvc.update(input.existingEvaluation.id, { status: "done" });
+      await logDoneGateBypass(db, {
+        companyId: input.run.companyId,
+        issueId: input.existingEvaluation.id,
+        issueIdentifier: input.existingEvaluation.identifier,
+        previousStatus: input.existingEvaluation.status,
+        reason: "recovery.source_resolved_watchdog_fold",
+        agentId: input.run.agentId,
+        runId: input.run.id,
+        originKind: STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND,
+      });
       await issuesSvc.addComment(input.existingEvaluation.id, [
         "Source-resolved watchdog fold.",
         "",
@@ -2792,6 +2803,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }) {
     const updated = await issuesSvc.update(input.issue.id, { status: "done" });
     if (!updated) return null;
+
+    await logDoneGateBypass(db, {
+      companyId: input.issue.companyId,
+      issueId: input.issue.id,
+      issueIdentifier: input.issue.identifier,
+      previousStatus: input.previousStatus,
+      reason: "recovery.reconcile_stranded_recovery_issue_auto_done",
+      runId: input.latestRun.id,
+      originKind: input.issue.originKind,
+    });
 
     const prefix = await getCompanyIssuePrefix(input.issue.companyId);
     await issuesSvc.addComment(
