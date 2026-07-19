@@ -649,6 +649,7 @@ export interface IssueExecutionState {
   currentParticipant: IssueExecutionStagePrincipal | null;
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest: IssueReviewRequest | null;
+  currentStageApprovers: IssueExecutionStagePrincipal[];
   completedStageIds: string[];
   lastDecisionId: string | null;
   lastDecisionOutcome: IssueExecutionDecisionOutcome | null;

@@ -241,6 +241,7 @@ export const issueExecutionStateSchema = z.object({
   currentParticipant: issueExecutionStagePrincipalSchema.nullable(),
   returnAssignee: issueExecutionStagePrincipalSchema.nullable(),
   reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),
+  currentStageApprovers: z.array(issueExecutionStagePrincipalSchema).optional().default([]),
   completedStageIds: z.array(z.string().uuid()).default([]),
   lastDecisionId: z.string().uuid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
