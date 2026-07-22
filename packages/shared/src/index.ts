@@ -1685,3 +1685,33 @@ export {
   type CreateEnvironmentCustomImageTerminalSessionToken,
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
+export {
+  EXECUTION_CHANGES_REQUESTED_WAKE_REASON,
+  classifyFailure,
+  countExecutionChangesRequestedWakes,
+  wakeReasonCountsAsExecutionAttempt,
+} from "./failure-classification.js";
+export type {
+  FailureClass,
+  FailureClassificationContext,
+  WakeReasonRow,
+} from "./failure-classification.js";
+export {
+  REFLECTION_COMPLIANCE_MARKERS,
+  REFLECTION_INSTRUCTION_PREFIX,
+  RETRY_CONTEXT_LAST_ERROR_MAX_LENGTH,
+  buildReflectionInstruction,
+  MAX_RETRY_ATTEMPTS,
+  buildRetryContext,
+  classifyRetryDisposition,
+  firstCommentSignalsReflection,
+  retryContextStamp,
+  retryGuidanceForFailureClass,
+  shouldInjectRetryContext,
+  truncateRetryError,
+} from "./retry-context.js";
+export type {
+  RetryContext,
+  RetryContextInput,
+  RetryDisposition,
+} from "./retry-context.js";
