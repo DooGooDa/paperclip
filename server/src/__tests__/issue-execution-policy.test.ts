@@ -95,14 +95,36 @@ describe("normalizeIssueExecutionPolicy", () => {
     expect(result!.mode).toBe("normal");
   });
 
-  it("rejects approvalsNeeded values above 1", () => {
+  it("accepts approvalsNeeded within the participant count", () => {
+    const result = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          type: "review",
+          approvalsNeeded: 2,
+          participants: [
+            { type: "agent", agentId: qaAgentId },
+            { type: "agent", agentId: coderAgentId },
+          ],
+        },
+      ],
+    });
+    expect(result!.stages).toHaveLength(1);
+    expect(result!.stages[0].participants).toHaveLength(2);
+    // normalize must carry the schema value through, not clobber it back to 1
+    expect(result!.stages[0].approvalsNeeded).toBe(2);
+  });
+
+  it("rejects approvalsNeeded exceeding the participant count", () => {
     expect(() =>
       normalizeIssueExecutionPolicy({
         stages: [
           {
             type: "review",
-            approvalsNeeded: 2,
-            participants: [{ type: "agent", agentId: qaAgentId }],
+            approvalsNeeded: 3,
+            participants: [
+              { type: "agent", agentId: qaAgentId },
+              { type: "agent", agentId: coderAgentId },
+            ],
           },
         ],
       }),
@@ -381,6 +403,167 @@ describe("issue execution policy transitions", () => {
       });
       // status should NOT be overridden — caller can set done
       expect(result.patch.status).toBeUndefined();
+    });
+  });
+
+  describe("n-of-m approval counting", () => {
+    function twoApproverReviewPolicy() {
+      return normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            type: "review",
+            approvalsNeeded: 2,
+            participants: [
+              { type: "agent", agentId: qaAgentId },
+              { type: "agent", agentId: ctoAgentId },
+            ],
+          },
+        ],
+      })!;
+    }
+
+    function pendingReviewState(policy: IssueExecutionPolicy, overrides: Partial<IssueExecutionState>): IssueExecutionState {
+      return {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        currentStageApprovers: [],
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        ...overrides,
+      };
+    }
+
+    it("keeps the stage pending on the first of two required approvals and rotates the reviewer", () => {
+      const policy = twoApproverReviewPolicy();
+      const reviewStageId = policy.stages[0].id;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: pendingReviewState(policy, {
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+          }),
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "First reviewer approves",
+      });
+
+      // 1 of 2 — must NOT complete; stage stays pending on the same review stage
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageId: reviewStageId,
+        currentStageType: "review",
+        currentStageApprovers: [{ type: "agent", agentId: qaAgentId }],
+        currentParticipant: { type: "agent", agentId: ctoAgentId },
+      });
+      // rotated to the next un-approved participant
+      expect(result.patch.assigneeAgentId).toBe(ctoAgentId);
+      expect(result.decision).toMatchObject({ stageId: reviewStageId, stageType: "review", outcome: "approved" });
+    });
+
+    it("completes the stage once the second required approval arrives", () => {
+      const policy = twoApproverReviewPolicy();
+      const reviewStageId = policy.stages[0].id;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: ctoAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: pendingReviewState(policy, {
+            currentParticipant: { type: "agent", agentId: ctoAgentId },
+            currentStageApprovers: [{ type: "agent", agentId: qaAgentId }],
+          }),
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: ctoAgentId },
+        commentBody: "Second reviewer approves",
+      });
+
+      // 2 of 2 — quorum reached, review-only policy → fully completed
+      expect(result.patch.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: [reviewStageId],
+        lastDecisionOutcome: "approved",
+      });
+      expect(result.decision).toMatchObject({ stageId: reviewStageId, stageType: "review", outcome: "approved" });
+    });
+
+    it("is idempotent — a repeat approval from an already-counted approver does not double-count", () => {
+      const policy = twoApproverReviewPolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: pendingReviewState(policy, {
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            currentStageApprovers: [{ type: "agent", agentId: qaAgentId }],
+          }),
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Same reviewer approves again",
+      });
+
+      const nextState = result.patch.executionState as IssueExecutionState;
+      expect(nextState.status).toBe("pending");
+      expect(nextState.currentStageApprovers).toHaveLength(1);
+    });
+
+    it("backward compat — approvalsNeeded=1 completes on the first approval even without a stored approver list", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [{ type: "review", participants: [{ type: "agent", agentId: qaAgentId }] }],
+      })!;
+      expect(policy.stages[0].approvalsNeeded).toBe(1);
+      const reviewStageId = policy.stages[0].id;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            // omit currentStageApprovers → simulates a pre-T8.2 persisted DB row
+            status: "pending",
+            currentStageId: reviewStageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Single reviewer approval",
+      });
+
+      expect(result.patch.executionState).toMatchObject({
+        status: "completed",
+        completedStageIds: [reviewStageId],
+        lastDecisionOutcome: "approved",
+      });
+      expect(result.decision).toMatchObject({ stageId: reviewStageId, outcome: "approved" });
     });
   });
 

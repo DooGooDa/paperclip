@@ -391,6 +391,7 @@ function createExecutionState(overrides: Partial<IssueExecutionState> = {}): Iss
     currentParticipant: { type: "agent", agentId: "agent-1", userId: null },
     returnAssignee: { type: "agent", agentId: "agent-2", userId: null },
     reviewRequest: null,
+    currentStageApprovers: [],
     completedStageIds: [],
     lastDecisionId: null,
     lastDecisionOutcome: "changes_requested",

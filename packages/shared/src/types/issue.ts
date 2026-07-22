@@ -595,7 +595,7 @@ export interface IssueExecutionStageParticipant extends IssueExecutionStagePrinc
 export interface IssueExecutionStage {
   id: string;
   type: IssueExecutionStageType;
-  approvalsNeeded: 1;
+  approvalsNeeded: number;
   participants: IssueExecutionStageParticipant[];
 }
 
@@ -649,6 +649,7 @@ export interface IssueExecutionState {
   currentParticipant: IssueExecutionStagePrincipal | null;
   returnAssignee: IssueExecutionStagePrincipal | null;
   reviewRequest: IssueReviewRequest | null;
+  currentStageApprovers: IssueExecutionStagePrincipal[];
   completedStageIds: string[];
   lastDecisionId: string | null;
   lastDecisionOutcome: IssueExecutionDecisionOutcome | null;

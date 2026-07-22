@@ -179,8 +179,16 @@ export const issueExecutionStageParticipantSchema = issueExecutionStagePrincipal
 export const issueExecutionStageSchema = z.object({
   id: z.string().uuid().optional(),
   type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
-  approvalsNeeded: z.literal(1).optional().default(1),
+  approvalsNeeded: z.number().int().min(1).optional().default(1),
   participants: z.array(issueExecutionStageParticipantSchema).default([]),
+}).superRefine((value, ctx) => {
+  if (value.participants.length > 0 && value.approvalsNeeded > value.participants.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "approvalsNeeded cannot exceed the number of participants",
+      path: ["approvalsNeeded"],
+    });
+  }
 });
 
 export const issueExecutionMonitorPolicySchema = z.object({
@@ -233,6 +241,7 @@ export const issueExecutionStateSchema = z.object({
   currentParticipant: issueExecutionStagePrincipalSchema.nullable(),
   returnAssignee: issueExecutionStagePrincipalSchema.nullable(),
   reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),
+  currentStageApprovers: z.array(issueExecutionStagePrincipalSchema).optional().default([]),
   completedStageIds: z.array(z.string().uuid()).default([]),
   lastDecisionId: z.string().uuid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
