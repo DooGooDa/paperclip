@@ -48,6 +48,8 @@ import {
   linkIssueApprovalSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
+  ISSUE_EVIDENCE_CLASSES,
+  classifyEvidence,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
   TASK_WATCHDOG_PRODUCT_BUG_ORIGIN_KIND,
   rejectIssueThreadInteractionSchema,
@@ -65,6 +67,7 @@ import {
   type CompanySearchResponse,
   type ExecutionWorkspace,
   type IssueBlockerDiagnosticFlag,
+  type IssueEvidencePayload,
   type IssueBlockerDiagnosticIssueSummary,
   type IssueBlockerDiagnosticNode,
   type IssueBlockerDiagnosticsReadiness,
@@ -232,6 +235,34 @@ const EXECUTOR_MANUAL_COMMENT_WHITELIST_PREFIXES = [
   "승격",
   "재배정",
 ] as const;
+
+// --- E6 done evidence gate (T6.3) ---
+// Deterministic evidence-sufficiency gate layered *after* the executor self-done-flip
+// role gate and the comment auto-approval role gate. Agent-actor done transitions on
+// non-whitelist issues must carry RICH evidence (2+ classes across description +
+// comments, via T6.2 classifyEvidence); THIN transitions are rejected. Human
+// (non-agent) actors and system-writer whitelist origins are exempt — HITL decisions
+// and routine/recovery writes are evidence-agnostic by design. Promotes the advisory
+// `~/.openclaw/scripts/evidence-check.sh` lint (RICH/THIN, same 6 classes) into a
+// server-enforced gate.
+const EVIDENCE_GATE_SYSTEM_ORIGIN_BYPASS = new Set<string>([
+  "routine_execution",
+  "stranded_issue_recovery",
+  "issue_productivity_review",
+  "harness_liveness_escalation",
+  "blocker_attention_open_recovery",
+]);
+
+// Exempt from the done evidence gate when the actor is not an agent (board/human HITL)
+// or the issue origin is a system-writer whitelist kind (routine/recovery).
+function isDoneEvidenceGateExempt(
+  actorType: string,
+  originKind: string | null | undefined,
+): boolean {
+  if (actorType !== "agent") return true;
+  if (typeof originKind === "string" && EVIDENCE_GATE_SYSTEM_ORIGIN_BYPASS.has(originKind)) return true;
+  return false;
+}
 
 const updateIssueRouteSchema = updateIssueSchema.extend({
   interrupt: z.boolean().optional(),
@@ -2151,6 +2182,23 @@ export function issueRoutes(
     actor: ReturnType<typeof getActorInfo>,
   ) {
     return resolveActorSourceTrustForIssue({ db, issue, actor });
+  }
+
+  // E6 done evidence gate (T6.3): aggregate the issue description + every comment body
+  // (+ an optional in-flight comment) and classify the combined text into the RICH/THIN
+  // evidence verdict. Mirrors evidence-check.sh's scan target (description + comments).
+  async function classifyIssueDoneEvidence(
+    issueId: string,
+    description: string | null | undefined,
+    extraText?: string | null,
+  ): Promise<IssueEvidencePayload> {
+    const comments = await svc.listComments(issueId, { order: "asc" });
+    const text = [
+      description ?? "",
+      ...comments.map((c) => c.body ?? ""),
+      extraText ?? "",
+    ].join("\n");
+    return classifyEvidence(text);
   }
 
   function hasExplicitIssueWorkspaceCreateSelection(input: Record<string, unknown>) {
@@ -7118,6 +7166,68 @@ export function issueRoutes(
       }
     }
 
+    // E6 done evidence gate (T6.3) — layered *after* the executor self-done-flip role
+    // gate above, as an additional deterministic layer (does not reorder the existing
+    // role/whitelist gates). Reject an agent-actor done transition whose evidence
+    // (description + comments + this request's comment) is THIN (<2 classes). Human
+    // actors and system-writer whitelist origins are exempt. Emits issue.done_rejected.
+    if (
+      req.actor.type === "agent" &&
+      typeof req.body.status === "string" &&
+      req.body.status === "done" &&
+      existing.status !== "done" &&
+      !isDoneEvidenceGateExempt(req.actor.type, existing.originKind)
+    ) {
+      const evidence = await classifyIssueDoneEvidence(
+        existing.id,
+        existing.description,
+        typeof req.body.comment === "string" ? req.body.comment : null,
+      );
+      if (evidence.verdict === "THIN") {
+        await logActivity(db, {
+          companyId: existing.companyId,
+          actorType: "agent",
+          actorId: req.actor.agentId ?? "unknown-agent",
+          agentId: req.actor.agentId ?? null,
+          runId: req.actor.runId ?? null,
+          action: "issue.done_rejected",
+          entityType: "issue",
+          entityId: existing.id,
+          details: {
+            identifier: existing.identifier,
+            reason: "done-evidence-insufficient",
+            source: "PATCH /issues/:id (status=done)",
+            originKind: existing.originKind ?? null,
+            evidence,
+            policy: {
+              rule: "done-evidence-gate",
+              requiredVerdict: "RICH",
+              evidenceClasses: ISSUE_EVIDENCE_CLASSES,
+              source: "evidence-check.sh 6-class → T6.2 classifyEvidence",
+            },
+          },
+        });
+        res.status(422).json({
+          error: "Done transition requires sufficient evidence",
+          errorCode: "issue_done_evidence_required",
+          details: {
+            issueId: existing.id,
+            verdict: evidence.verdict,
+            evidenceClasses: evidence.classes,
+            requiredVerdict: "RICH",
+            originKind: existing.originKind ?? null,
+            policy: {
+              rule: "done-evidence-gate",
+              guidance:
+                "done 전 description·comment에 증거 2+ 클래스(PR/머지·커밋 SHA·파일 경로·테스트 결과·URL·Slack ts)를 남겨라. 실질 작업이면 산출물 경로를 명시.",
+              source: "references/shared/evidence-check.sh (advisory → E6 server gate)",
+            },
+          },
+        });
+        return;
+      }
+    }
+
     // Executor done-revert guard (DGG-11899 thread 1779741393 — Kuromi 2nd warning).
     // Mirror of the self-done-flip guard above: once an authorized actor
     // (board / ceo-role / system) commits a done flip, executor agents cannot
@@ -9434,11 +9544,33 @@ export function issueRoutes(
       actorMatchesExecutionParticipant(actor, currentExecutionState.currentParticipant ?? null) &&
       isApprovalReviewComment(req.body.body);
 
+    // E6 done evidence gate (T6.3) — comment auto-approval path. When an APPROVED
+    // reviewer comment would auto-transition the issue to done, require RICH evidence
+    // across description + comments (+ this approval comment). THIN evidence blocks the
+    // transition while still persisting the comment (so the reviewer sees the rejection
+    // in-thread) and emits issue.done_rejected. Human actors / whitelist origins exempt.
+    let autoApprovalEvidenceRejection: IssueEvidencePayload | null = null;
+    if (
+      shouldAutoApproveReviewComment &&
+      !isDoneEvidenceGateExempt(actor.actorType, currentIssue.originKind)
+    ) {
+      const evidence = await classifyIssueDoneEvidence(
+        currentIssue.id,
+        currentIssue.description,
+        req.body.body,
+      );
+      if (evidence.verdict === "THIN") {
+        autoApprovalEvidenceRejection = evidence;
+      }
+    }
+    const effectiveAutoApproveReviewComment =
+      shouldAutoApproveReviewComment && autoApprovalEvidenceRejection === null;
+
     // Persist the comment and the auto-approval state transition atomically when both apply.
     // Without a single transaction, a 422 (or any error) thrown by the status update after the
     // comment is inserted would leave an orphan comment without the corresponding state change.
     let comment: Awaited<ReturnType<typeof svc.addComment>>;
-    if (shouldAutoApproveReviewComment) {
+    if (effectiveAutoApproveReviewComment) {
       const transition = applyIssueExecutionPolicyTransition({
         issue: currentIssue,
         policy: currentExecutionPolicy,
@@ -9560,6 +9692,32 @@ export function issueRoutes(
         presentation: req.body.presentation ?? null,
         metadata: req.body.metadata ?? null,
         sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
+      });
+    }
+
+    if (autoApprovalEvidenceRejection) {
+      await logActivity(db, {
+        companyId: currentIssue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.done_rejected",
+        entityType: "issue",
+        entityId: currentIssue.id,
+        details: {
+          identifier: currentIssue.identifier,
+          reason: "done-evidence-insufficient",
+          source: "auto_approval_comment",
+          originKind: currentIssue.originKind ?? null,
+          commentId: comment.id,
+          evidence: autoApprovalEvidenceRejection,
+          policy: {
+            rule: "done-evidence-gate",
+            requiredVerdict: "RICH",
+            source: "evidence-check.sh 6-class → T6.2 classifyEvidence",
+          },
+        },
       });
     }
 

@@ -1004,3 +1004,59 @@ export const restoreIssueDocumentRevisionSchema = z.object({});
 export type IssueDocumentFormat = z.infer<typeof issueDocumentFormatSchema>;
 export type UpsertIssueDocument = z.infer<typeof upsertIssueDocumentSchema>;
 export type RestoreIssueDocumentRevision = z.infer<typeof restoreIssueDocumentRevisionSchema>;
+
+// --- Evidence classification (T6.2) ---
+// `~/.openclaw/scripts/evidence-check.sh` 의 6 증거 클래스를 verbatim 이식한 순수 판정.
+// done/in_review 전이 게이트(T6.3)가 description + comments 텍스트를 스캔해 RICH/THIN 판정에 사용.
+// class 2(커밋 SHA)만 원본 대비 강화: 7-40 hex 단어 경계 + UUID(8-4-4-4-12) 형태 배제로 오탐 차단.
+
+export const ISSUE_EVIDENCE_CLASSES = [
+  "pr_merge",
+  "commit_sha",
+  "file_path",
+  "test_result",
+  "url",
+  "slack_ts",
+] as const;
+
+export const issueEvidenceClassSchema = z.enum(ISSUE_EVIDENCE_CLASSES);
+export type IssueEvidenceClass = z.infer<typeof issueEvidenceClassSchema>;
+
+export const issueEvidenceVerdictSchema = z.enum(["RICH", "THIN"]);
+export type IssueEvidenceVerdict = z.infer<typeof issueEvidenceVerdictSchema>;
+
+export const issueEvidencePayloadSchema = z.object({
+  classes: z.array(issueEvidenceClassSchema),
+  verdict: issueEvidenceVerdictSchema,
+});
+export type IssueEvidencePayload = z.infer<typeof issueEvidencePayloadSchema>;
+
+// UUID(8-4-4-4-12)의 hex 세그먼트가 커밋 SHA로 오검출되는 것을 차단하기 위한 마스킹 패턴.
+const ISSUE_EVIDENCE_UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
+const ISSUE_EVIDENCE_COMMIT_SHA_RE = /\b[0-9a-f]{7,40}\b/i;
+
+// UUID를 먼저 제거한 뒤 SHA를 검출 — UUID 배제 로직. (이 한 줄을 제거하면 UUID가 SHA로 오검출됨)
+function issueEvidenceHasCommitSha(text: string): boolean {
+  const withoutUuids = text.replace(ISSUE_EVIDENCE_UUID_RE, " ");
+  return ISSUE_EVIDENCE_COMMIT_SHA_RE.test(withoutUuids);
+}
+
+const ISSUE_EVIDENCE_MATCHERS: ReadonlyArray<{
+  readonly klass: IssueEvidenceClass;
+  readonly detect: (text: string) => boolean;
+}> = [
+  { klass: "pr_merge", detect: (t) => /PR #\d+|pull\/\d+|merge[d]? |squash/i.test(t) },
+  { klass: "commit_sha", detect: issueEvidenceHasCommitSha },
+  { klass: "file_path", detect: (t) => /\b(docs|artifacts|research|evidence|scripts)\/[\w\-./]+|\.md\b|\.png\b/i.test(t) },
+  { klass: "test_result", detect: (t) => /\d+\/\d+\s*(pass|green|PASS)|exit 0|vitest|typecheck/i.test(t) },
+  { klass: "url", detect: (t) => /https?:\/\/\S+/i.test(t) },
+  { klass: "slack_ts", detect: (t) => /ts=1\d{9}/i.test(t) },
+];
+
+// 증거 텍스트를 6 클래스로 분류한다. RICH = 2개 이상 클래스, 그 외 THIN.
+// negation(부정 표현) 처리는 하지 않는다 — 순수 클래스 판정만 담당하고, negation 차단은 게이트(T6.3)의 몫.
+export function classifyEvidence(text: string): IssueEvidencePayload {
+  const source = text ?? "";
+  const classes = ISSUE_EVIDENCE_MATCHERS.filter((m) => m.detect(source)).map((m) => m.klass);
+  return { classes, verdict: classes.length >= 2 ? "RICH" : "THIN" };
+}

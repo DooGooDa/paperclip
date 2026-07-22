@@ -6,6 +6,7 @@ const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  listComments: vi.fn(),
   update: vi.fn(),
 }));
 
@@ -137,6 +138,11 @@ describe("issue telemetry routes", () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    // E6 done evidence gate (T6.3): supply RICH prior-comment evidence so agent done
+    // transitions under test are not blocked by the evidence gate.
+    mockIssueService.listComments.mockResolvedValue([
+      { body: "Evidence: merged PR #123, tests 12/12 pass" },
+    ]);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue("todo"),
       ...patch,

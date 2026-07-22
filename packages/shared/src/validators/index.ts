@@ -366,6 +366,18 @@ export {
   type UpsertIssueWatchdog,
 } from "./issue.js";
 
+
+export {
+  ISSUE_EVIDENCE_CLASSES,
+  issueEvidenceClassSchema,
+  issueEvidenceVerdictSchema,
+  issueEvidencePayloadSchema,
+  classifyEvidence,
+  type IssueEvidenceClass,
+  type IssueEvidenceVerdict,
+  type IssueEvidencePayload,
+} from "./issue.js";
+
 export {
   COMPANY_SEARCH_DEFAULT_LIMIT,
   COMPANY_SEARCH_MAX_LIMIT,
